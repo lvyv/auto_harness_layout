@@ -1,0 +1,35 @@
+[project]
+name = "ahl"
+version = "0.1.0"
+description = "电气线束自动化布局"
+readme = "README.md"
+authors = [
+    { name = "lvyu", email = "lvyu@cxtc.edu.cn" },
+]
+requires-python = ">=3.10,<3.14"
+
+dependencies = [
+    "fastapi>=0.119.0",
+    "uvicorn[standard]>=0.27.0",
+    "pydantic-settings>=2.1.0",
+    "pydantic>=2.6.0",
+    "pyproj>=3.6.0",
+    "numpy>=1.26.0",
+    "matplotlib>=3.10.8",
+]
+
+[project.scripts]
+ahl = "ahl.main:start"
+
+[tool.uv]
+python-install-mirror = "https://registry.npmmirror.com/-/binary/python-build-standalone/"
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple/"
+default = true
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
