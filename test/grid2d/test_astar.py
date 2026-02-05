@@ -1,7 +1,6 @@
 """Tests for A* pathfinding algorithm."""
 
 import pytest
-import numpy as np
 
 from ahl.grid2d.core.grid import Grid
 from ahl.grid2d.core.cell_type import CellType

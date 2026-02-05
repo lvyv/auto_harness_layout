@@ -2,8 +2,7 @@
 
 import pytest
 import numpy as np
-from pathlib import Path
-import tempfile
+
 
 from ahl.grid2d.core.grid import Grid
 from ahl.grid2d.core.cell_type import CellType

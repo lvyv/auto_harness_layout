@@ -1,6 +1,5 @@
 """Tests for SDF computation."""
 
-import pytest
 import numpy as np
 
 from ahl.grid2d.core.sdf import compute_sdf

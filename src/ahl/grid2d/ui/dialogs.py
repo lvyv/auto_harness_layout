@@ -4,9 +4,7 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QSpinBox, QPushButton, QFileDialog, QMessageBox
 )
-from PyQt6.QtCore import Qt
 
-from ..core.grid import Grid
 from ..utils.validators import GridConfig
 
 
