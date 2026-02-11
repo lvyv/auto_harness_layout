@@ -22,6 +22,7 @@ dependencies = [
     "opencv-python>=4.7",
     "scikit-image>=0.21",
     "networkx>=3.1",
+    "ortools>=9.15.6755",
 ]
 
 [project.scripts]
