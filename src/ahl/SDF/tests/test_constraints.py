@@ -8,7 +8,7 @@ import pytest
 
 from src.harness.constraints import (
     compute_curvature, compute_bend_radius, check_bend_radius,
-    path_length, path_statistics,
+    path_length,
 )
 from src.harness.cable import Cable, HarnessSpec
 from src.harness.smoothing import smooth_path_bspline

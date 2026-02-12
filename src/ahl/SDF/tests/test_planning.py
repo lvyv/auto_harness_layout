@@ -4,7 +4,6 @@ import sys
 sys.path.insert(0, ".")
 
 import numpy as np
-import pytest
 
 from src.sdf import build_sdf_2d
 from src.planning import AStarPlanner

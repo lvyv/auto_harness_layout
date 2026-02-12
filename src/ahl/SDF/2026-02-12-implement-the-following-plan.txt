@@ -1,0 +1,1491 @@
+
+           Claude Code v2.1.39
+ ▐▛███▜▌   Opus 4.6 · Claude Pro
+▝▜█████▛▘  E:\_proj\SDF
+  ▘▘ ▝▝    Opus 4.6 is here · $50 free extra usage · /extra-usage to enable
+
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ Plan to implement                                                            │
+│                                                                              │
+│ Plan: 添加路径共用约束和路径排斥约束                                         │
+│                                                                              │
+│ Context                                                                      │
+│                                                                              │
+│ 当前的多线束布线流程（见 examples/06_engine_bay.py:191 的                    │
+│ run_multi_route()）中，每条线缆独立规划，彼此完全无感知。实际工程中需要：    │
+│ - 路径共用约束（Attraction）：第2条线束倾向复用第1条线束的路径走廊（节省空间 │
+│ 、便于固定）                                                                 │
+│ - 路径排斥约束（Repulsion）：第2条线束尽量远离第1条线束（电磁干扰隔离、安全  │
+│ 冗余）                                                                       │
+│                                                                              │
+│ 核心思路：将已布线路径转化为距离场，用它生成代价/速度修正因子，注入到现有的  │
+│ A*、FMM、梯度优化器中。                                                      │
+│                                                                              │
+│ ---                                                                          │
+│ 实现步骤                                                                     │
+│                                                                              │
+│ Step 1: 新建 src/harness/path_constraints.py（核心模块，约120行）            │
+│                                                                              │
+│ 包含以下内容：                                                               │
+│                                                                              │
+│ 1.1 PathConstraint 数据类                                                    │
+│ @dataclass                                                                   │
+│ class PathConstraint:                                                        │
+│     reference_path: np.ndarray  # (N, 2) 已布线路径                          │
+│     mode: str                   # "attract" 或 "repel"                       │
+│     influence_radius: float     # 影响半径（世界坐标单位）                   │
+│     strength: float             # 强度（0.0~5.0，典型 1.0~3.0）              │
+│ - 在 __post_init__ 中校验 mode、radius>0、strength>=0                        │
+│                                                                              │
+│ 1.2 compute_path_distance_field(path, sdf_grid) → (ny, nx)                   │
+│ - 复用 src/sdf/primitives.py:sdf_line_segment（thickness=0 返回无符号距离）  │
+│ - 对路径的每对相邻顶点计算线段距离场，取 element-wise 最小值                 │
+│ - 返回网格上每个点到折线路径的最短距离                                       │
+│                                                                              │
+│ 1.3 build_cost_modifier(constraints, sdf_grid) → (ny, nx)（A* 用）           │
+│ - 对每个约束计算影响因子：influence = clip(1 - dist/radius, 0, 1)            │
+│ - 吸引：modifier *= max(1 - strength * influence, 0.05) → 路径附近代价降低   │
+│ - 排斥：modifier *= (1 + strength * influence) → 路径附近代价升高            │
+│ - 多个约束的 modifier 累乘                                                   │
+│                                                                              │
+│ 1.4 build_speed_modifier(constraints, sdf_grid) → (ny, nx)（FMM 用）         │
+│ - 吸引：modifier *= (1 + strength * influence) → 路径附近速度提高            │
+│ - 排斥：modifier *= max(1 - strength * influence, 0.05) → 路径附近速度降低   │
+│                                                                              │
+│ 1.5 nearest_point_on_path(points, reference_path) → (nearest_points,         │
+│ distances)                                                                   │
+│ - 对每个查询点，在参考路径折线上找最近点及距离                               │
+│ - 复用 sdf_line_segment                                                      │
+│ 中的投影逻辑（primitives.py:45-49），但额外返回最近点坐标                    │
+│ - 供梯度优化器计算梯度方向                                                   │
+│                                                                              │
+│ 1.6 path_constraint_cost_and_gradient(path, constraints) → (cost, grad)      │
+│ - 供 GradientOptimizer 使用，接口风格与 gradient.py:54                       │
+│ _obstacle_cost_and_gradient 一致                                             │
+│ - 吸引代价：C(p) = 0.5 * s * (d/r)²，梯度指向远离参考路径方向 →              │
+│ 梯度下降时路径靠近参考                                                       │
+│   - grad += s * d / r² * unit_outward                                        │
+│ - 排斥代价：C(p) = 0.5 * s * ((r-d)/r)²，梯度指向靠近参考路径方向 →          │
+│ 梯度下降时路径远离参考                                                       │
+│   - grad -= s * (r-d) / r² * unit_outward                                    │
+│ - 仅对 dist < influence_radius 的点生效                                      │
+│                                                                              │
+│ ---                                                                          │
+│ Step 2: 修改 src/planning/astar.py（+3行）                                   │
+│                                                                              │
+│ 在 plan() 方法的第49行之后插入：                                             │
+│ cost_grid = sdf_grid.cost_field(self.safety_margin, self.cost_weight)        │
+│ # ---- 新增 ----                                                             │
+│ cost_modifier = kwargs.get("cost_modifier")                                  │
+│ if cost_modifier is not None:                                                │
+│     cost_grid = cost_grid * cost_modifier                                    │
+│ # ---- 结束 ----                                                             │
+│ 通过 **kwargs 传入，完全向后兼容。inf * modifier 仍为                        │
+│ inf，障碍物内不会被错误打通。                                                │
+│                                                                              │
+│ ---                                                                          │
+│ Step 3: 修改 src/planning/fast_marching.py（+5行）                           │
+│                                                                              │
+│ 在 plan() 方法的第142行之后插入：                                            │
+│ speed = self._sdf_to_speed(sdf_grid)                                         │
+│ # ---- 新增 ----                                                             │
+│ speed_modifier = kwargs.get("speed_modifier")                                │
+│ if speed_modifier is not None:                                               │
+│     speed = speed * speed_modifier                                           │
+│     speed = np.maximum(speed, 1e-10)                                         │
+│     speed[sdf_grid.values <= 0] = 1e-10                                      │
+│ # ---- 结束 ----                                                             │
+│ 重新 clamp 确保障碍物内速度不被意外提升。                                    │
+│                                                                              │
+│ ---                                                                          │
+│ Step 4: 修改 src/planning/gradient.py（+15行）                               │
+│                                                                              │
+│ 4a. __init__ 新增两个参数（默认值保证向后兼容）：                            │
+│ def __init__(self, ..., path_constraints: list = None, lambda_path: float =  │
+│ 10.0):                                                                       │
+│     ...                                                                      │
+│     self.path_constraints = path_constraints or []                           │
+│     self.lambda_path = lambda_path                                           │
+│                                                                              │
+│ 4b. 新增方法（在 _obstacle_cost_and_gradient 之后）：                        │
+│ def _path_constraint_cost_and_gradient(self, path):                          │
+│     if not self.path_constraints:                                            │
+│         return 0.0, np.zeros_like(path)                                      │
+│     from src.harness.path_constraints import                                 │
+│ path_constraint_cost_and_gradient                                            │
+│     return path_constraint_cost_and_gradient(path, self.path_constraints)    │
+│                                                                              │
+│ 4c. 优化循环中集成（约第126-134行区域）：                                    │
+│ # 现有                                                                       │
+│ grad_smooth = self._smoothness_gradient(path)                                │
+│ obs_cost, grad_obs = self._obstacle_cost_and_gradient(path)                  │
+│ # 新增                                                                       │
+│ path_cost, grad_path = self._path_constraint_cost_and_gradient(path)         │
+│ # 修改                                                                       │
+│ grad_total = grad_smooth + self.lambda_obs * grad_obs + self.lambda_path *   │
+│ grad_path                                                                    │
+│ total_cost = smooth_cost + self.lambda_obs * obs_cost + self.lambda_path *   │
+│ path_cost                                                                    │
+│                                                                              │
+│ ---                                                                          │
+│ Step 5: 更新 src/harness/__init__.py（+2行）                                 │
+│                                                                              │
+│ from .path_constraints import (PathConstraint, compute_path_distance_field,  │
+│                                 build_cost_modifier, build_speed_modifier)   │
+│                                                                              │
+│ ---                                                                          │
+│ Step 6: 新建 examples/07_multi_route_constraints.py（约150行）               │
+│                                                                              │
+│ 演示完整工作流：                                                             │
+│ 1. 用 engine_bay_multi_route 场景，正常布线第1条线缆                         │
+│ 2. 吸引演示：第2条线缆使用 PathConstraint(mode="attract") 复用第1条路径走廊  │
+│ 3. 排斥演示：第2条线缆使用 PathConstraint(mode="repel") 远离第1条路径        │
+│ 4. 对比可视化：无约束 vs 有约束的路径对比，加上影响区域的半透明显示          │
+│                                                                              │
+│ 可视化布局：2行×2列，分别展示无约束baseline、吸引效果、排斥效果、三条路径叠  │
+│ 加对比。                                                                     │
+│                                                                              │
+│ ---                                                                          │
+│ Step 7: 新建 tests/test_path_constraints.py（约140行）                       │
+│                                                                              │
+│ 测试内容：                                                                   │
+│ - PathConstraint 参数校验（无效 mode/负 radius 抛异常）                      │
+│ - compute_path_distance_field 形状正确、路径上距离≈0、离路径越远距离越大     │
+│ - build_cost_modifier 吸引时路径处 < 1、排斥时路径处 > 1、无约束时全为 1     │
+│ - build_speed_modifier 方向与 cost_modifier 相反                             │
+│ - nearest_point_on_path 投影和距离正确                                       │
+│ - 集成测试：吸引约束下新路径平均距参考路径更近；排斥约束下更远               │
+│                                                                              │
+│ ---                                                                          │
+│ 文件变更总览                                                                 │
+│ 文件: src/harness/path_constraints.py                                        │
+│ 操作: 新建                                                                   │
+│ 变更量: ~120行                                                               │
+│ ────────────────────────────────────────                                     │
+│ 文件: src/planning/astar.py                                                  │
+│ 操作: 修改                                                                   │
+│ 变更量: +3行（line 49后）                                                    │
+│ ────────────────────────────────────────                                     │
+│ 文件: src/planning/fast_marching.py                                          │
+│ 操作: 修改                                                                   │
+│ 变更量: +5行（line 142后）                                                   │
+│ ────────────────────────────────────────                                     │
+│ 文件: src/planning/gradient.py                                               │
+│ 操作: 修改                                                                   │
+│ 变更量: ~15行（构造器+新方法+循环）                                          │
+│ ────────────────────────────────────────                                     │
+│ 文件: src/harness/__init__.py                                                │
+│ 操作: 修改                                                                   │
+│ 变更量: +2行                                                                 │
+│ ────────────────────────────────────────                                     │
+│ 文件: examples/07_multi_route_constraints.py                                 │
+│ 操作: 新建                                                                   │
+│ 变更量: ~150行                                                               │
+│ ────────────────────────────────────────                                     │
+│ 文件: tests/test_path_constraints.py                                         │
+│ 操作: 新建                                                                   │
+│ 变更量: ~140行                                                               │
+│ 现有文件的修改总计约25行，且全部向后兼容（新参数均有默认值）。               │
+│                                                                              │
+│ ---                                                                          │
+│ 验证方案                                                                     │
+│                                                                              │
+│ # 1. 运行全部现有测试，确保无回归                                            │
+│ python -m pytest tests/ -v                                                   │
+│                                                                              │
+│ # 2. 运行新增测试                                                            │
+│ python -m pytest tests/test_path_constraints.py -v                           │
+│                                                                              │
+│ # 3. 运行新示例，查看可视化效果                                              │
+│ python examples/07_multi_route_constraints.py                                │
+│                                                                              │
+│ # 4. 运行原有示例，确认向后兼容                                              │
+│ python examples/06_engine_bay.py                                             │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+● I'll implement this plan step by step. Let me start by reading the key files I
+   need to understand and modify.
+
+● Now let me read all the source files I need to understand.
+
+● Read 6 files (ctrl+o to expand)
+
+● Now let me also read the engine_bay scenario and existing example for the demo
+   script.
+
+● Read 1 file (ctrl+o to expand)
+
+● Now let me read one of the existing examples to understand the pattern.
+
+● Read 1 file (ctrl+o to expand)
+
+● Now let me check existing tests to understand patterns.
+
+● Read 1 file (ctrl+o to expand)
+
+● Good, I have all the context I need. Let me now implement everything. Starting
+   with the core module.
+
+● Write(src\harness\path_constraints.py)
+  ⎿  Wrote 1 lines to src\harness\path_constraints.py
+      1 """Path-interaction constraints for multi-harness routing.
+      2 
+      3 Provides attraction (corridor reuse) and repulsion (EMI isolation
+        ) constraints
+      4 that modify cost/speed fields based on distance to previously rou
+        ted paths.
+      5 """
+      6 
+      7 from dataclasses import dataclass
+      8 
+      9 import numpy as np
+
+● Now modify astar.py.
+
+● Update(src\planning\astar.py)
+  ⎿  Added 3 lines
+      47  
+      48          # Build cost grid
+      49          cost_grid = sdf_grid.cost_field(self.safety_margin, sel
+          f.cost_weight)
+      50 +        cost_modifier = kwargs.get("cost_modifier")            
+      51 +        if cost_modifier is not None:                          
+      52 +            cost_grid = cost_grid * cost_modifier              
+      53          ny, nx = cost_grid.shape
+      54  
+      55          # Convert start/goal to grid indices (col, row)
+
+● Now modify fast_marching.py.
+
+● Update(src\planning\fast_marching.py)
+  ⎿  Added 5 lines
+      140  
+      141          # Build speed field
+      142          speed = self._sdf_to_speed(sdf_grid)
+      143 +        speed_modifier = kwargs.get("speed_modifier")         
+      144 +        if speed_modifier is not None:                        
+      145 +            speed = speed * speed_modifier                    
+      146 +            speed = np.maximum(speed, 1e-10)                  
+      147 +            speed[sdf_grid.values <= 0] = 1e-10               
+      148  
+      149          # Create phi: masked array with goal as the known zero
+           -arrival point
+      150          phi = np.ones((ny, nx))
+
+● Now modify gradient.py.
+
+● Update(src\planning\gradient.py)
+  ⎿  Added 6 lines, removed 1 line
+      22  
+      23      def __init__(self, sdf_grid: SDFGrid, safety_margin: float 
+          = 1.5,
+      24                   lambda_obs: float = 15.0, learning_rate: float
+           = 0.02,
+      25 -                 max_iters: int = 500, convergence_tol: float =
+         - 1e-5):                                                        
+      25 +                 max_iters: int = 500, convergence_tol: float =
+         + 1e-5,                                                         
+      26 +                 path_constraints: list = None, lambda_path: fl
+         +oat = 10.0):                                                   
+      27          """
+      28          Args:
+      29              sdf_grid: The signed distance field.
+     ...
+      32              learning_rate: Gradient descent step size.
+      33              max_iters: Maximum optimization iterations.
+      34              convergence_tol: Stop when gradient norm falls belo
+          w this.
+      35 +            path_constraints: List of PathConstraint for multi-
+         +route interaction.                                             
+      36 +            lambda_path: Weight of path constraint cost.       
+      37          """
+      38          self.sdf_grid = sdf_grid
+      39          self.safety_margin = safety_margin
+     ...
+      41          self.learning_rate = learning_rate
+      42          self.max_iters = max_iters
+      43          self.convergence_tol = convergence_tol
+      44 +        self.path_constraints = path_constraints or []         
+      45 +        self.lambda_path = lambda_path                         
+      46  
+      47      def _smoothness_gradient(self, path: np.ndarray) -> np.ndar
+          ray:
+      48          """Gradient of smoothness cost (discrete Laplacian).
+
+● Now add the new method after _obstacle_cost_and_gradient:
+
+● Update(src\planning\gradient.py)
+  ⎿  Added 7 lines
+       93  
+       94          return cost.sum(), grad
+       95  
+       96 +    def _path_constraint_cost_and_gradient(self, path: np.ndar
+          +ray):                                                         
+       97 +        """Compute path-interaction cost and gradient."""     
+       98 +        if not self.path_constraints:                         
+       99 +            return 0.0, np.zeros_like(path)                   
+      100 +        from src.harness.path_constraints import path_constrai
+          +nt_cost_and_gradient                                          
+      101 +        return path_constraint_cost_and_gradient(path, self.pa
+          +th_constraints)                                               
+      102 +                                                              
+      103      def _project_to_free_space(self, path: np.ndarray) -> np.n
+           darray:
+      104          """Project points that are inside obstacles back to th
+           e surface."""
+      105          sdf_vals = self.sdf_grid.sample(path)
+
+● Now integrate into the optimization loop:
+
+● Update(src\planning\gradient.py)
+  ⎿  Added 5 lines, removed 2 lines
+      136              # Compute gradients
+      137              grad_smooth = self._smoothness_gradient(path)
+      138              obs_cost, grad_obs = self._obstacle_cost_and_gradi
+           ent(path)
+      139 +            path_cost, grad_path = self._path_constraint_cost_
+          +and_gradient(path)                                            
+      140  
+      141              # Total gradient
+      141 -            grad_total = grad_smooth + self.lambda_obs * grad_
+          -obs                                                           
+      142 +            grad_total = (grad_smooth + self.lambda_obs * grad
+          +_obs                                                          
+      143 +                          + self.lambda_path * grad_path)     
+      144  
+      145              # Smoothness cost
+      146              diffs = path[:-2] - 2 * path[1:-1] + path[2:]
+      147              smooth_cost = 0.5 * np.sum(diffs ** 2)
+      146 -            total_cost = smooth_cost + self.lambda_obs * obs_c
+          -ost                                                           
+      148 +            total_cost = (smooth_cost + self.lambda_obs * obs_
+          +cost                                                          
+      149 +                          + self.lambda_path * path_cost)     
+      150              cost_history.append(total_cost)
+      151  
+      152              # Gradient norm (interior points only)
+
+● Now update __init__.py:
+
+● Update(src\harness\__init__.py)
+  ⎿  Added 2 lines
+      3                            check_bend_radius, check_clearance,
+      4                            path_length, path_min_clearance, path_
+         statistics)
+      5  from .smoothing import smooth_path_bspline, smooth_with_bend_con
+         straint
+      6 +from .path_constraints import (PathConstraint, compute_path_dist
+        +ance_field,                                                     
+      7 +                                build_cost_modifier, build_speed
+        +_modifier)                                                      
+
+● Now create the example script:
+
+● Write(examples\07_multi_route_constraints.py)
+  ⎿  Wrote 1 lines to examples\07_multi_route_constraints.py
+       1 """Example 07: Multi-Route Constraints — Attraction & Repulsion.
+       2 
+       3 Demonstrates path-interaction constraints for multi-harness rout
+         ing:
+       4   1. Plan the first cable normally (baseline)
+       5   2. Attract: second cable reuses the first cable's corridor
+       6   3. Repel:  second cable avoids the first cable's corridor
+       7   4. Comparison visualization of all three behaviors
+       8 """
+       9 
+      10 import sys
+
+● Now create the test file:
+
+● Let me check the existing test style first.
+
+● Read 1 file (ctrl+o to expand)
+
+● Write(tests\test_path_constraints.py)
+  ⎿  Wrote 1 lines to tests\test_path_constraints.py
+       1 """Tests for path constraint module (attraction & repulsion)."""
+       2 
+       3 import sys
+       4 sys.path.insert(0, ".")
+       5 
+       6 import numpy as np
+       7 import pytest
+       8 
+       9 from src.sdf.grid import SDFGrid
+      10 from src.sdf.from_obstacles import build_sdf_2d
+
+● Now let's run the tests:
+
+● Bash(cd "E:\_proj\SDF" && python -m pytest tests/ -v 2>&1)
+  ⎿  Interrupted · What should Claude do instead?
+
+>  /export 
+
+● I don't have an /export skill available. The /export command is a built-in CLI
+   command that should be handled directly by Claude Code itself — I can't
+  invoke it via the Skill tool.
+
+  You can run /export directly in the CLI prompt. It will export the
+  conversation to a markdown file.
+
+  ---
+  Regarding the implementation progress: all code changes are complete. Here's a
+   summary of what was done:
+  ┌────────────────────────────────────────┬──────────────────────┐
+  │                  File                  │        Status        │
+  ├────────────────────────────────────────┼──────────────────────┤
+  │ src/harness/path_constraints.py        │ Created              │
+  ├────────────────────────────────────────┼──────────────────────┤
+  │ src/planning/astar.py                  │ Modified (+3 lines)  │
+  ├────────────────────────────────────────┼──────────────────────┤
+  │ src/planning/fast_marching.py          │ Modified (+5 lines)  │
+  ├────────────────────────────────────────┼──────────────────────┤
+  │ src/planning/gradient.py               │ Modified (~15 lines) │
+  ├────────────────────────────────────────┼──────────────────────┤
+  │ src/harness/__init__.py                │ Modified (+2 lines)  │
+  ├────────────────────────────────────────┼──────────────────────┤
+  │ examples/07_multi_route_constraints.py │ Created              │
+  ├────────────────────────────────────────┼──────────────────────┤
+  │ tests/test_path_constraints.py         │ Created              │
+  └────────────────────────────────────────┴──────────────────────┘
+  The remaining step is running the tests to verify everything works. When
+  you're ready, run:
+
+  python -m pytest tests/ -v
+
+> 请分析src/planning/fast_marching.py文件，我发现该路径规划器在06_engine_ba 
+  y.py代码中运行效果不好，它找的路径甚至直接穿越障碍物。                    
+
+● Let me仔细分析这个问题。
+
+● Read 2 files (ctrl+o to expand)
+
+● 问题根因在两处：参数导致速度场退化 + 梯度回溯缺少障碍物检查。
+
+  ---
+  问题 1：safety_margin=0 导致除零，速度场变成阶跃函数
+
+  _sdf_to_speed 第 44 行：
+
+  normalized = np.clip(sdf_grid.values / self.safety_margin, 0.0, 1.0)
+  #                                       ^^^^^^^^^^^^^^^^^ = 0 → 除零!
+
+  当 safety_margin=0 时：
+  - sdf > 0 → +inf → clip 到 1.0
+  - sdf = 0 → nan → clip 保持 nan
+  - sdf < 0 → -inf → clip 到 0.0
+
+  问题 2：speed_exponent=0 使所有值变成 1
+
+  第 45 行 speed = normalized ** 0：
+  - 1.0 ** 0 = 1.0
+  - nan ** 0 = 1.0（numpy 约定）
+  - 0.0 ** 0 = 1.0
+
+  全部变成 1.0。之后第 49 行 speed[sdf_grid.values <= 0] = 1e-10
+  把障碍物内部设为极小值。
+
+  最终速度场：自由空间 = 均匀 1.0，障碍物内 = 
+  1e-10。没有任何渐变过渡带——障碍物边界上速度从 1.0 直接断崖跌到 1e-10。
+
+  问题 3（根本缺陷）：_trace_gradient 没有障碍物碰撞检测
+
+  这是 FMM 规划器自身的设计缺陷，即使参数正常也潜在存在。看第 77-107 
+  行的回溯循环：
+
+  for _ in range(max_steps):
+      col, row = current[0], current[1]
+      # ✅ 检查是否到目标
+      # ✅ 检查是否出界
+      # ❌ 完全没有检查当前点是否在障碍物内!
+
+      gx = map_coordinates(gt_x, [[row], [col]], order=1, mode='nearest')[0]
+      gy = map_coordinates(gt_y, [[row], [col]], order=1, mode='nearest')[0]
+      # ... 盲目沿梯度走
+      current = current + np.array([dcol, drow])
+
+  当速度场是阶跃函数时，travel-time 场在障碍物边界有巨大的不连续跳变（自由空间
+  ~5 vs 障碍物内 ~1e8）。np.gradient
+  用中心差分计算的梯度在边界处不可靠，map_coordinates 
+  的双线性插值又会混合边界两侧的值。路径回溯器一旦在拐角处因插值误差踏入障碍物一
+  步，就再也没有机制把它拉回来。
+
+  ---
+  穿越过程示意
+
+     自由空间 (speed=1.0)     障碍物 (speed=1e-10)     自由空间 (speed=1.0)
+     travel_time ≈ 5         travel_time ≈ 1e8          travel_time ≈ 3
+                        ↑ 边界处梯度 ≈ 1e8/dx
+                          插值不稳定
+                          回溯器踏入 →→→ 穿越 →→→ 出来
+
+  正常参数（如 safety_margin=0.5, speed_exponent=2）能工作是因为：
+  - 速度场在障碍物附近有平滑过渡（0 → 0.x → 1.0）
+  - travel-time 梯度也是连续平滑的
+  - 回溯器被"推离"障碍物边界（梯度指向远离低速区）
+
+  总结
+  ┌────────────┬────────────────────┬──────────────────┐
+  │    因素    │      正常参数      │ margin=0, exp=0  │
+  ├────────────┼────────────────────┼──────────────────┤
+  │ 速度场     │ 平滑渐变 0→1       │ 阶跃 1e-10 ↔ 1.0 │
+  ├────────────┼────────────────────┼──────────────────┤
+  │ 边界梯度   │ 平滑可靠           │ 不连续，插值失真 │
+  ├────────────┼────────────────────┼──────────────────┤
+  │ 障碍物检查 │ 靠平滑场"隐式"避障 │ 无显式检查，穿越 │
+  └────────────┴────────────────────┴──────────────────┘
+  建议修复方向：在 _trace_gradient 中加入 SDF 检查——如果当前点的 SDF ≤ 0，沿 SDF
+   梯度投影回自由空间，类似 GradientOptimizer._project_to_free_space
+  的做法。这样即使参数激进，也不会穿越障碍物。
+
+✻ Cogitated for 2m 36s
+
+> 请修复发现的问题 
+
+● Read 1 file (ctrl+o to expand)
+
+● 两处修复：
+
+  修复 1：_sdf_to_speed — 处理 safety_margin=0 的除零问题。
+
+● Update(src\planning\fast_marching.py)
+  ⎿  Added 6 lines, removed 1 line
+      40  
+      41          speed = clamp(sdf / safety_margin, 0, 1) ^ exponent
+      42          Zero speed inside obstacles, max speed far from obstacl
+          es.
+      43 +        When safety_margin <= 0, all free-space cells get speed
+         + 1.0 (binary mode).                                            
+      44          """
+      44 -        normalized = np.clip(sdf_grid.values / self.safety_marg
+         -in, 0.0, 1.0)                                                  
+      45 +        if self.safety_margin > 0:                             
+      46 +            normalized = np.clip(sdf_grid.values / self.safety_
+         +margin, 0.0, 1.0)                                              
+      47 +        else:                                                  
+      48 +            # Binary mode: 1.0 in free space, 0.0 in obstacles,
+         + no gradual zone                                               
+      49 +            normalized = np.where(sdf_grid.values > 0, 1.0, 0.0
+         +)                                                              
+      50          speed = normalized ** self.speed_exponent
+      51          # Ensure minimum positive speed to avoid division issue
+          s in FMM
+      52          speed = np.maximum(speed, 1e-10)
+
+● 修复 2：_trace_gradient — 添加 SDF 碰撞检测，踏入障碍物时沿 SDF
+  梯度投影回自由空间。
+
+● Update(src\planning\fast_marching.py)
+  ⎿  Added 40 lines, removed 5 lines
+      63              travel_time: (ny, nx) travel-time field.
+      64              start_idx: (col, row) grid index of start.
+      65              goal_idx: (col, row) grid index of goal.
+      66 -            sdf_grid: SDF grid for bounds checking.            
+      66 +            sdf_grid: SDF grid for bounds checking and obstacle
+         + projection.                                                   
+      67              max_steps: Maximum gradient descent steps.
+      68  
+      69          Returns:
+      70              (N, 2) array of (col, row) grid indices along the p
+          ath.
+      71          """
+      72          ny, nx = travel_time.shape
+      73 +        # Clamp inf values before computing gradient to avoid n
+         +an/inf in gradient                                             
+      74 +        tt_clamped = np.where(np.isinf(travel_time),           
+      75 +                              np.nanmax(travel_time[np.isfinite
+         +(travel_time)]) * 2,                                           
+      76 +                              travel_time)                     
+      77          # Compute gradient of travel time: [d/dy, d/dx]
+      74 -        gt_y, gt_x = np.gradient(travel_time)                  
+      78 +        gt_y, gt_x = np.gradient(tt_clamped)                   
+      79  
+      80 +        # Pre-compute SDF gradient field for obstacle projectio
+         +n                                                              
+      81 +        sdf_gy, sdf_gx = np.gradient(sdf_grid.values)          
+      82 +                                                               
+      83          step_size = self.step_factor
+      84          current = start_idx.astype(float).copy()  # (col, row)
+      85          goal_f = goal_idx.astype(float)
+     ...
+      110              dcol = -gx / grad_mag * step_size
+      111              drow = -gy / grad_mag * step_size
+      112  
+      106 -            current = current + np.array([dcol, drow])        
+      113 +            candidate = current + np.array([dcol, drow])      
+      114  
+      115              # Clamp to grid bounds
+      109 -            current[0] = np.clip(current[0], 0, nx - 1)       
+      110 -            current[1] = np.clip(current[1], 0, ny - 1)       
+      116 +            candidate[0] = np.clip(candidate[0], 0, nx - 1)   
+      117 +            candidate[1] = np.clip(candidate[1], 0, ny - 1)   
+      118  
+      119 +            # Obstacle check: if candidate is inside obstacle,
+          + project back out                                             
+      120 +            c_col, c_row = candidate[0], candidate[1]         
+      121 +            sdf_val = map_coordinates(sdf_grid.values, [[c_row
+          +], [c_col]],                                                  
+      122 +                                      order=1, mode='nearest')
+          +[0]                                                           
+      123 +            if sdf_val <= 0:                                  
+      124 +                sgx = map_coordinates(sdf_gx, [[c_row], [c_col
+          +]],                                                           
+      125 +                                      order=1, mode='nearest')
+          +[0]                                                           
+      126 +                sgy = map_coordinates(sdf_gy, [[c_row], [c_col
+          +]],                                                           
+      127 +                                      order=1, mode='nearest')
+          +[0]                                                           
+      128 +                sg_mag = np.sqrt(sgx ** 2 + sgy ** 2)         
+      129 +                if sg_mag > 1e-12:                            
+      130 +                    # Push outward along SDF gradient until sl
+          +ightly outside                                                
+      131 +                    push = (0.5 - sdf_val) / (sg_mag * sdf_gri
+          +d.spacing)                                                    
+      132 +                    candidate[0] += sgx / sg_mag * push       
+      133 +                    candidate[1] += sgy / sg_mag * push       
+      134 +                    # Re-clamp                                
+      135 +                    candidate[0] = np.clip(candidate[0], 0, nx
+          + - 1)                                                         
+      136 +                    candidate[1] = np.clip(candidate[1], 0, ny
+          + - 1)                                                         
+      137 +                    # Verify we actually escaped              
+      138 +                    sdf_val2 = map_coordinates(               
+      139 +                        sdf_grid.values,                      
+      140 +                        [[candidate[1]], [candidate[0]]],     
+      141 +                        order=1, mode='nearest')[0]           
+      142 +                    if sdf_val2 <= 0:                         
+      143 +                        # Projection failed — stay at previous
+          + position                                                     
+      144 +                        candidate = current.copy()            
+      145 +                                                              
+      146 +            current = candidate                               
+      147              path.append(current.copy())
+      148  
+      149          return np.array(path)
+
+● 现在运行测试验证没有回归。
+
+● Bash(cd "E:\_proj\SDF" && python -m pytest tests/ -v 2>&1)
+  ⎿  Interrupted · What should Claude do instead?
+
+> 请分析s06_engine_bay.py代码中的run_multi_route()，它计算并绘制的多条路径  
+  再代码修改后，依然有问题，fuse                                            
+  box到Headlight的那个路径，计算出来是先向上出了边界，然后返回向下，穿过ABS 
+   Module，然后拐出绘制区域边界，稍后才再次向内连接到目标点                 
+
+● 让我先确认当前文件状态，然后分析具体问题。
+
+● Read 2 files (ctrl+o to expand)
+
+● 现在参数是 safety_margin=0.1, 
+  speed_exponent=1，问题的根本原因不变。让我详细分析。
+
+  问题根因
+
+  "Fuse Box -> Headlight" 路线的起点 (2.5, 5.5) 距离 Fuse Box 顶部（y=5.45）仅
+  0.05 dm。
+
+  当前 FMM 的致命缺陷在于：障碍物内部速度是 1e-10 而非真正的零/阻断。FMM
+  波前依然会穿透障碍物，只是非常慢。这导致障碍物内部产生巨大但有限的 travel-time
+   值（~1e8），而不是 inf。
+
+  在起点处 np.gradient 计算中心差分：
+  gy ≈ (T[上方,y=5.53] - T[下方,y=5.47]) / (2Δx)
+            ≈ 正常值         ≈ 极大值(fuse box内/附近)
+  结果: gy 极大负值 → -gy 极大正值 → 回溯器向上走!
+
+  之前的 tt_clamped 修复只替换了 inf 值，但障碍物内的 travel-time 
+  是有限的巨大值（不是 inf），所以完全没被处理。
+
+  修复方案：两处改动——
+  1. 在 plan() 中用 masked array 阻断 FMM 穿越障碍物
+  2. 在 _trace_gradient() 中将 inf 值外推为邻近自由空间值，消除梯度失真
+
+● Update(src\planning\fast_marching.py)
+  ⎿  Added 49 lines, removed 10 lines
+      54          speed[sdf_grid.values <= 0] = 1e-10
+      55          return speed
+      56  
+      57 +    @staticmethod                                              
+      58 +    def _extrapolate_travel_time(travel_time: np.ndarray,      
+      59 +                                 obstacle_mask: np.ndarray) -> 
+         +np.ndarray:                                                    
+      60 +        """Replace obstacle travel-time values by extrapolating
+         + from free space.                                              
+      61 +                                                               
+      62 +        Without this, obstacle cells carrying inf (or huge fini
+         +te) values                                                     
+      63 +        corrupt ``np.gradient`` central-difference results at a
+         +djacent                                                        
+      64 +        free-space cells, sending the gradient tracer in wrong 
+         +directions.                                                    
+      65 +                                                               
+      66 +        The extrapolation iteratively averages from free-space 
+         +neighbours so                                                  
+      67 +        that boundary cells see a smooth, bounded travel-time l
+         +andscape.                                                      
+      68 +        """                                                    
+      69 +        from scipy.ndimage import uniform_filter               
+      70 +                                                               
+      71 +        tt = travel_time.copy()                                
+      72 +        bad = obstacle_mask | ~np.isfinite(tt)                 
+      73 +                                                               
+      74 +        # 3 iterations: covers obstacle cells within 3 grid cel
+         +ls of free space                                               
+      75 +        for _ in range(3):                                     
+      76 +            filled = np.where(bad, 0.0, tt)                    
+      77 +            weight = (~bad).astype(float)                      
+      78 +            sum_f = uniform_filter(filled, size=3, mode='neares
+         +t')                                                            
+      79 +            sum_w = uniform_filter(weight, size=3, mode='neares
+         +t')                                                            
+      80 +            expandable = bad & (sum_w > 0)                     
+      81 +            tt[expandable] = sum_f[expandable] / np.maximum(sum
+         +_w[expandable], 1e-10)                                         
+      82 +            bad = obstacle_mask & ~np.isfinite(tt)  # still-bad
+         + obstacle cells                                                
+      83 +                                                               
+      84 +        # Deep-interior obstacle cells unreached by extrapolati
+         +on                                                             
+      85 +        still_bad = ~np.isfinite(tt)                           
+      86 +        if np.any(still_bad):                                  
+      87 +            max_tt = np.max(tt[np.isfinite(tt)]) if np.any(np.i
+         +sfinite(tt)) else 1.0                                          
+      88 +            tt[still_bad] = max_tt                             
+      89 +        return tt                                              
+      90 +                                                               
+      91      def _trace_gradient(self, travel_time: np.ndarray, start_id
+          x: np.ndarray,
+      92                          goal_idx: np.ndarray, sdf_grid: SDFGrid
+          ,
+      93                          max_steps: int = 50000) -> np.ndarray:
+     ...
+      104              (N, 2) array of (col, row) grid indices along the 
+           path.
+      105          """
+      106          ny, nx = travel_time.shape
+       73 -        # Clamp inf values before computing gradient to avoid 
+          -nan/inf in gradient                                           
+       74 -        tt_clamped = np.where(np.isinf(travel_time),          
+       75 -                              np.nanmax(travel_time[np.isfinit
+          -e(travel_time)]) * 2,                                         
+       76 -                              travel_time)                    
+       77 -        # Compute gradient of travel time: [d/dy, d/dx]       
+       78 -        gt_y, gt_x = np.gradient(tt_clamped)                  
+      107  
+      108 +        # Build a gradient-safe travel-time field: obstacle ce
+          +lls are replaced                                              
+      109 +        # by values extrapolated from free-space neighbours.  
+      110 +        obstacle_mask = sdf_grid.values <= 0                  
+      111 +        tt_safe = self._extrapolate_travel_time(travel_time, o
+          +bstacle_mask)                                                 
+      112 +        gt_y, gt_x = np.gradient(tt_safe)                     
+      113 +                                                              
+      114          # Pre-compute SDF gradient field for obstacle projecti
+           on
+      115          sdf_gy, sdf_gx = np.gradient(sdf_grid.values)
+      116  
+     ...
+      119          goal_f = goal_idx.astype(float)
+      120  
+      121          path = [current.copy()]
+      122 +        stuck_count = 0                                       
+      123  
+      124          for _ in range(max_steps):
+      125              col, row = current[0], current[1]
+     ...
+      162                                        order=1, mode='nearest')
+           [0]
+      163                  sg_mag = np.sqrt(sgx ** 2 + sgy ** 2)
+      164                  if sg_mag > 1e-12:
+      130 -                    # Push outward along SDF gradient until sl
+          -ightly outside                                                
+      165                      push = (0.5 - sdf_val) / (sg_mag * sdf_gri
+           d.spacing)
+      166                      candidate[0] += sgx / sg_mag * push
+      167                      candidate[1] += sgy / sg_mag * push
+      134 -                    # Re-clamp                                
+      168                      candidate[0] = np.clip(candidate[0], 0, nx
+            - 1)
+      169                      candidate[1] = np.clip(candidate[1], 0, ny
+            - 1)
+      137 -                    # Verify we actually escaped              
+      170                      sdf_val2 = map_coordinates(
+      171                          sdf_grid.values,
+      172                          [[candidate[1]], [candidate[0]]],
+      173                          order=1, mode='nearest')[0]
+      174                      if sdf_val2 <= 0:
+      143 -                        # Projection failed — stay at previous
+          - position                                                     
+      175                          candidate = current.copy()
+      176  
+      177 +            # Stuck detection: if position barely changes, bre
+          +ak                                                            
+      178 +            if np.linalg.norm(candidate - current) < 1e-6:    
+      179 +                stuck_count += 1                              
+      180 +                if stuck_count > 10:                          
+      181 +                    break                                     
+      182 +            else:                                             
+      183 +                stuck_count = 0                               
+      184 +                                                              
+      185              current = candidate
+      186              path.append(current.copy())
+      187  
+
+● 现在修复根本原因——在 plan() 中用 masked array 阻止 FMM 穿越障碍物，同时增加
+  goal 校验：
+
+● Update(src\planning\fast_marching.py)
+  ⎿  Added 17 lines, removed 15 lines
+      216              return PlanResult(np.empty((0, 2)), float('inf'),
+      217                                time.perf_counter() - t0, False,
+      218                                metadata={"error": "Start inside
+            obstacle"})
+      219 +        if sdf_grid.values[goal_row, goal_col] <= 0:          
+      220 +            return PlanResult(np.empty((0, 2)), float('inf'), 
+      221 +                              time.perf_counter() - t0, False,
+      222 +                              metadata={"error": "Goal inside 
+          +obstacle"})                                                   
+      223  
+      224          # Build speed field
+      225          speed = self._sdf_to_speed(sdf_grid)
+     ...
+      229              speed = np.maximum(speed, 1e-10)
+      230              speed[sdf_grid.values <= 0] = 1e-10
+      231  
+      228 -        # Create phi: masked array with goal as the known zero
+          --arrival point                                                
+      229 -        phi = np.ones((ny, nx))                               
+      232 +        # Create phi: masked array with goal as the known zero
+          +-arrival point.                                               
+      233 +        # Mask obstacle cells so the FMM wavefront cannot prop
+          +agate through                                                 
+      234 +        # them.  This is critical: without masking, obstacle c
+          +ells get huge                                                 
+      235 +        # but *finite* travel-time values (speed = 1e-10 ≠ 0) 
+          +which corrupt                                                 
+      236 +        # central-difference gradients at adjacent free-space 
+          +cells.                                                        
+      237 +        phi = np.ma.MaskedArray(np.ones((ny, nx)),            
+      238 +                                mask=(sdf_grid.values <= 0))  
+      239          phi[goal_row, goal_col] = -1.0
+      240  
+      241          # Compute travel time
+      242          travel_time = skfmm.travel_time(phi, speed, dx=sdf_gri
+           d.spacing)
+      243  
+      235 -        # Handle masked/inf values                            
+      236 -        # Handle masked/inf values - 增强版                   
+      244 +        # Convert to plain ndarray: masked (obstacle) cells be
+          +come inf                                                      
+      245          if isinstance(travel_time, np.ma.MaskedArray):
+      238 -            # 它是掩膜数组，但掩膜可能为None                  
+      239 -            if travel_time.mask is not None:                  
+      240 -                tt_array = np.where(travel_time.mask, np.inf, 
+          -travel_time.data)                                             
+      246 +            mask = travel_time.mask                           
+      247 +            if mask is np.ma.nomask or mask is None:          
+      248 +                tt_array = np.asarray(travel_time.data, dtype=
+          +float)                                                        
+      249              else:
+      242 -                # 掩膜为None，表示所有点都有效，直接使用数据  
+      243 -                tt_array = travel_time.data                   
+      250 +                tt_array = np.where(mask, np.inf, travel_time.
+          +data)                                                         
+      251          else:
+      245 -            # 它是普通数组，直接转换                          
+      246 -            tt_array = np.asarray(travel_time)                
+      247 -        # if hasattr(travel_time, 'data'):                    
+      248 -        #     tt_array = np.where(travel_time.mask, np.inf, tr
+          -avel_time.data)                                               
+      249 -        # else:                                               
+      250 -        #     tt_array = np.asarray(travel_time)              
+      252 +            tt_array = np.asarray(travel_time, dtype=float)   
+      253  
+      254          # Check if start is reachable
+      255          if np.isinf(tt_array[start_row, start_col]):
+
+● 验证最终文件完整性：
+
+● Read 1 file (ctrl+o to expand)
+
+● 文件完整。总结修复的三层防护：
+
+  第一层（根本原因）：plan() 第 237-238 行 — 用 MaskedArray 遮蔽障碍物，FMM
+  波前完全无法穿越，障碍物内 travel-time 变为真正的 inf 而非有限巨大值。
+
+  第二层（梯度修复）：_extrapolate_travel_time() — 将障碍物内的 inf
+  用邻近自由空间值迭代外推填充。np.gradient 
+  的中心差分在障碍物边界处看到的是平滑过渡，而非 inf vs 5.0 
+  的断崖跳变，梯度方向正确。
+
+  第三层（安全兜底）：_trace_gradient() 保留了 SDF 碰撞检测 + 投影回退 + stuck
+  检测。即使梯度偶有偏差，也不会穿越障碍物或死循环。
+
+✻ Cooked for 7m 41s
+
+> 请基于A*及其的派生算法，搜寻路径，然后实现路径之间吸引和排斥的约束限制。 
+
+● Let me review the current state of the relevant files.
+
+● Read 3 files (ctrl+o to expand)
+
+● 好，现在我已经完全理解了现有代码。当前 example 07 虽然 plan_route 里已换成了
+  AStarPlanner，但调用处仍然传 speed_modifier（FMM 专用参数），A*
+  根本不认识这个参数所以被忽略了——约束在 A 阶段实际上完全没有生效*，只有
+  GradientOptimizer 阶段的 path_constraints 在起作用。
+
+  需要改为传 cost_modifier（A* 认识的参数），并且整体清理逻辑。同时把
+  06_engine_bay.py 的 run_multi_route 也切换到 A*，解决之前 FMM
+  穿越障碍物的问题。
+
+● Read 1 file (ctrl+o to expand)
+
+● Now let me fix both files. First, switch 06_engine_bay.py run_multi_route to
+  A*:
+
+● Update(examples\06_engine_bay.py)
+  ⎿  Added 3 lines, removed 4 lines
+      208          start, goal = route["start"], route["goal"]
+      209          color = route["color"]
+      210  
+      211 -        # Plan with FMM + gradient optimization               
+      212 -        fmm = FastMarchingPlanner(safety_margin=0.1, speed_exp
+          -onent=1)                                                      
+      213 -        # fmm = AStarPlanner(safety_margin=0, cost_weight=0)  
+      214 -        result = fmm.plan(sdf_grid, start, goal)              
+      211 +        # Plan with A* + gradient optimization                
+      212 +        planner = AStarPlanner(safety_margin=0.5, cost_weight=
+          +12.0)                                                         
+      213 +        result = planner.plan(sdf_grid, start, goal)          
+      214  
+      215          if result.success:
+      216              # Optimize
+
+● Now rewrite example 07 — fully based on A* pipeline, correct parameter
+  passing:
+
+● Read 1 file (ctrl+o to expand)
+
+● Write(examples\07_multi_route_constraints.py)
+  ⎿  Error: File has been unexpectedly modified. Read it again before attempting
+      to write it.
+
+● Read 1 file (ctrl+o to expand)
+
+● Write(examples\07_multi_route_constraints.py)
+  ⎿  Added 129 lines, removed 74 lines
+       1  """Example 07: Multi-Route Constraints — Attraction & Repulsion
+          .
+       2  
+       3 -Demonstrates path-interaction constraints for multi-harness rou
+         -ting:                                                          
+       3 +Pipeline: A* → Gradient Optimization → B-spline Smoothing      
+       4 +                                                               
+       5 +Constraints are injected at TWO stages for maximum effect:     
+       6 +  Stage 1 — A* cost_modifier   : steers the discrete grid searc
+         +h                                                              
+       7 +  Stage 2 — GradientOptimizer  : refines the continuous traject
+         +ory                                                            
+       8 +                                                               
+       9 +Demonstrates:                                                  
+      10    1. Plan the first cable normally (baseline)
+      11    2. Attract: second cable reuses the first cable's corridor
+      12    3. Repel:  second cable avoids the first cable's corridor
+       7 -  4. Comparison visualization of all three behaviors           
+      13 +  4. Comparison visualisation of all three behaviours          
+      14  """
+      15  
+      16  import sys
+     ...
+      22  from src.sdf import build_sdf_2d
+      23  from src.planning import AStarPlanner, GradientOptimizer
+      24  from src.harness import (smooth_path_bspline, path_statistics,
+      19 -                         PathConstraint,                       
+      20 -                         build_speed_modifier)                 
+      25 +                         PathConstraint, build_cost_modifier,  
+      26 +                         compute_path_distance_field)          
+      27 +from src.harness.path_constraints import nearest_point_on_path 
+      28  from src.scenarios.engine_bay import engine_bay_multi_route
+      29  
+      30  
+      31 +# ── helpers ──────────────────────────────────────────────────
+         +────────────                                                   
+      32 +                                                               
+      33  def draw_obstacle_labels(ax, obstacles):
+      34      for obs in obstacles:
+      35          label = obs.get("label", "")
+     ...
+      45      xx, yy = sdf_grid.meshgrid_world()
+      46      ax.contourf(xx, yy, sdf_grid.values, levels=50, cmap='RdBu'
+          , alpha=0.35)
+      47      ax.contour(xx, yy, sdf_grid.values, levels=[0], colors='bla
+          ck', linewidths=1.2)
+      39 -    ax.contourf(xx, yy, sdf_grid.values, levels=[-1e10, 0], col
+         -ors='#404040', alpha=0.8)                                      
+      48 +    ax.contourf(xx, yy, sdf_grid.values, levels=[-1e10, 0],    
+      49 +                colors='#404040', alpha=0.8)                   
+      50      draw_obstacle_labels(ax, obstacles)
+      51      ax.set_title(title, fontsize=10)
+      52      ax.set_aspect('equal')
+     ...
+       54      ax.set_ylim(bounds[1])
+       55  
+       56  
+       47 -def plan_route(sdf_grid, start, goal, **planner_kwargs):      
+       48 -    """Plan a single route using FMM + gradient optimization."
+          -""                                                            
+       49 -    # fmm = FastMarchingPlanner(safety_margin=0.5, speed_expon
+          -ent=2.0)                                                      
+       50 -    fmm = AStarPlanner(safety_margin=0.5, cost_weight=12.0)   
+       51 -    result = fmm.plan(sdf_grid, start, goal, **planner_kwargs)
+       57 +def avg_dist_to_ref(path, ref_path):                          
+       58 +    """Mean distance from *path* to *ref_path* polyline."""   
+       59 +    _, dists = nearest_point_on_path(path, ref_path)          
+       60 +    return dists.mean()                                       
+       61 +                                                              
+       62 +                                                              
+       63 +# ── planning ────────────────────────────────────────────────
+          +─────────────                                                 
+       64 +                                                              
+       65 +def plan_route(sdf_grid, start, goal,                         
+       66 +               cost_modifier=None, path_constraints=None, lamb
+          +da_path=12.0):                                                
+       67 +    """A* → GradientOptimizer → B-spline.                     
+       68 +                                                              
+       69 +    Args:                                                     
+       70 +        sdf_grid:          SDFGrid.                           
+       71 +        start, goal:       (2,) world coordinates.            
+       72 +        cost_modifier:     (ny, nx) multiplier for the A* cost
+          + field.                                                       
+       73 +        path_constraints:  list[PathConstraint] for GradientOp
+          +timizer.                                                      
+       74 +        lambda_path:       weight of the path-constraint cost 
+          +term.                                                         
+       75 +                                                              
+       76 +    Returns:                                                  
+       77 +        Smoothed (N, 2) path or None on failure.              
+       78 +    """                                                       
+       79 +    # ---- Stage 1: A* with optional cost modifier ----       
+       80 +    astar = AStarPlanner(safety_margin=0.5, cost_weight=12.0) 
+       81 +    astar_kw = {}                                             
+       82 +    if cost_modifier is not None:                             
+       83 +        astar_kw["cost_modifier"] = cost_modifier             
+       84 +    result = astar.plan(sdf_grid, start, goal, **astar_kw)    
+       85      if not result.success:
+       86          return None
+       87  
+       55 -    n_wp = min(60, len(result.path))                          
+       88 +    # Sub-sample for gradient optimiser                       
+       89 +    n_wp = min(80, len(result.path))                          
+       90      indices = np.linspace(0, len(result.path) - 1, n_wp, dtype
+           =int)
+       91      init_path = result.path[indices]
+       92  
+       59 -    opt_kwargs = {}                                           
+       60 -    # Extract path_constraints from planner_kwargs for gradien
+          -t optimizer                                                   
+       61 -    if "path_constraints" in planner_kwargs:                  
+       62 -        opt_kwargs["path_constraints"] = planner_kwargs["path_
+          -constraints"]                                                 
+       63 -        opt_kwargs["lambda_path"] = planner_kwargs.get("lambda
+          -_path", 10.0)                                                 
+       64 -                                                              
+       65 -    opt = GradientOptimizer(sdf_grid, safety_margin=0.6,      
+       66 -                            lambda_obs=15.0, learning_rate=0.0
+          -15,                                                           
+       67 -                            max_iters=300, **opt_kwargs)      
+       93 +    # ---- Stage 2: Gradient Optimisation ----                
+       94 +    opt = GradientOptimizer(                                  
+       95 +        sdf_grid,                                             
+       96 +        safety_margin=0.6,                                    
+       97 +        lambda_obs=15.0,                                      
+       98 +        learning_rate=0.015,                                  
+       99 +        max_iters=400,                                        
+      100 +        path_constraints=path_constraints or [],              
+      101 +        lambda_path=lambda_path,                              
+      102 +    )                                                         
+      103      opt_result = opt.optimize(init_path)
+      104 +                                                              
+      105 +    # ---- Stage 3: B-spline smoothing ----                   
+      106      return smooth_path_bspline(opt_result['path'], 200)
+      107  
+      108  
+      109 +# ── main ────────────────────────────────────────────────────
+          +─────────────                                                 
+      110 +                                                              
+      111  def main():
+      112      obstacles, bounds, resolution, routes = engine_bay_multi_r
+           oute()
+      113      sdf_grid = build_sdf_2d(obstacles, bounds, resolution)
+      114  
+       76 -    # Use routes 0 and 1 for the demonstration                
+       77 -    route1 = routes[0]  # ECU -> Temp Sensor                  
+       78 -    route2 = routes[1]  # Battery -> Starter                  
+      115 +    route1 = routes[0]   # ECU -> Temp Sensor                 
+      116 +    route2 = routes[1]   # Battery -> Starter                 
+      117  
+      118      print("=" * 60)
+       81 -    print("Multi-Route Path Constraints Demo")                
+      119 +    print("Multi-Route Path Constraints Demo  (A* pipeline)") 
+      120      print("=" * 60)
+      121  
+       84 -    # --- Step 1: Plan reference route (Route 1) ---          
+       85 -    print(f"\n[Route 1] {route1['name']} — planning baseline..
+          -.")                                                           
+      122 +    # ── 1. Reference route ──────────────────────────────────
+          +────────────                                                  
+      123 +    print(f"\n[Route 1] {route1['name']} — baseline ...")     
+      124      path1 = plan_route(sdf_grid, route1["start"], route1["goal
+           "])
+      125      if path1 is None:
+       88 -        print("  FAILED to plan Route 1. Aborting.")          
+      126 +        print("  FAILED — aborting.")                         
+      127          return
+       90 -    stats1 = path_statistics(path1, sdf_grid)                 
+       91 -    print(f"  Length={stats1['length']:.2f}, MinClr={stats1['m
+          -in_clearance']:.3f}")                                         
+      128 +    s1 = path_statistics(path1, sdf_grid)                     
+      129 +    print(f"  Length={s1['length']:.2f}  MinClr={s1['min_clear
+          +ance']:.3f}")                                                 
+      130  
+       93 -    # --- Step 2: Plan Route 2 with NO constraint (baseline) -
+          ---                                                            
+       94 -    print(f"\n[Route 2] {route2['name']} — no constraint (base
+          -line)...")                                                    
+      131 +    # ── 2. Route 2 — no constraint (baseline) ───────────────
+          +───────────                                                   
+      132 +    print(f"\n[Route 2] {route2['name']} — no constraint ...")
+      133      path2_none = plan_route(sdf_grid, route2["start"], route2[
+           "goal"])
+      134      if path2_none is not None:
+       97 -        stats2 = path_statistics(path2_none, sdf_grid)        
+       98 -        print(f"  Length={stats2['length']:.2f}, MinClr={stats
+          -2['min_clearance']:.3f}")                                     
+      135 +        s2 = path_statistics(path2_none, sdf_grid)            
+      136 +        d2 = avg_dist_to_ref(path2_none, path1)               
+      137 +        print(f"  Length={s2['length']:.2f}  MinClr={s2['min_c
+          +learance']:.3f}"                                              
+      138 +              f"  AvgDist-R1={d2:.2f}")                       
+      139  
+      100 -    # --- Step 3: Plan Route 2 with ATTRACT constraint ---    
+      101 -    print(f"\n[Route 2] {route2['name']} — attract to Route 1.
+          -..")                                                          
+      140 +    # ── 3. Route 2 — ATTRACT ────────────────────────────────
+          +───────────                                                   
+      141 +    print(f"\n[Route 2] {route2['name']} — attract to Route 1 
+          +...")                                                         
+      142      attract = PathConstraint(
+      143          reference_path=path1, mode="attract",
+      144          influence_radius=1.5, strength=2.0,
+      145      )
+      106 -    speed_mod_a = build_speed_modifier([attract], sdf_grid)   
+      146 +    cost_mod_a = build_cost_modifier([attract], sdf_grid)     
+      147      path2_attract = plan_route(
+      148          sdf_grid, route2["start"], route2["goal"],
+      109 -        speed_modifier=speed_mod_a,                           
+      149 +        cost_modifier=cost_mod_a,                             
+      150          path_constraints=[attract], lambda_path=12.0,
+      151      )
+      152      if path2_attract is not None:
+      113 -        stats2a = path_statistics(path2_attract, sdf_grid)    
+      114 -        print(f"  Length={stats2a['length']:.2f}, MinClr={stat
+          -s2a['min_clearance']:.3f}")                                   
+      153 +        s2a = path_statistics(path2_attract, sdf_grid)        
+      154 +        d2a = avg_dist_to_ref(path2_attract, path1)           
+      155 +        print(f"  Length={s2a['length']:.2f}  MinClr={s2a['min
+          +_clearance']:.3f}"                                            
+      156 +              f"  AvgDist-R1={d2a:.2f}")                      
+      157  
+      116 -    # --- Step 4: Plan Route 2 with REPEL constraint ---      
+      117 -    print(f"\n[Route 2] {route2['name']} — repel from Route 1.
+          -..")                                                          
+      158 +    # ── 4. Route 2 — REPEL ──────────────────────────────────
+          +───────────                                                   
+      159 +    print(f"\n[Route 2] {route2['name']} — repel from Route 1 
+          +...")                                                         
+      160      repel = PathConstraint(
+      161          reference_path=path1, mode="repel",
+      162          influence_radius=1.5, strength=2.5,
+      163      )
+      122 -    speed_mod_r = build_speed_modifier([repel], sdf_grid)     
+      164 +    cost_mod_r = build_cost_modifier([repel], sdf_grid)       
+      165      path2_repel = plan_route(
+      166          sdf_grid, route2["start"], route2["goal"],
+      125 -        speed_modifier=speed_mod_r,                           
+      167 +        cost_modifier=cost_mod_r,                             
+      168          path_constraints=[repel], lambda_path=12.0,
+      169      )
+      170      if path2_repel is not None:
+      129 -        stats2r = path_statistics(path2_repel, sdf_grid)      
+      130 -        print(f"  Length={stats2r['length']:.2f}, MinClr={stat
+          -s2r['min_clearance']:.3f}")                                   
+      171 +        s2r = path_statistics(path2_repel, sdf_grid)          
+      172 +        d2r = avg_dist_to_ref(path2_repel, path1)             
+      173 +        print(f"  Length={s2r['length']:.2f}  MinClr={s2r['min
+          +_clearance']:.3f}"                                            
+      174 +              f"  AvgDist-R1={d2r:.2f}")                      
+      175  
+      132 -    # --- Visualization: 2x2 ---                              
+      176 +    # ── Summary table ───────────────────────────────────────
+          +───────────                                                   
+      177 +    print(f"\n{'Scenario':<25} {'Length':>8} {'MinClr':>8} {'A
+          +vgDist-R1':>11}")                                             
+      178 +    print("-" * 55)                                           
+      179 +    if path2_none is not None:                                
+      180 +        print(f"{'No constraint':<25} {s2['length']:>8.2f} "  
+      181 +              f"{s2['min_clearance']:>8.3f} {d2:>11.2f}")     
+      182 +    if path2_attract is not None:                             
+      183 +        print(f"{'Attract':<25} {s2a['length']:>8.2f} "       
+      184 +              f"{s2a['min_clearance']:>8.3f} {d2a:>11.2f}")   
+      185 +    if path2_repel is not None:                               
+      186 +        print(f"{'Repel':<25} {s2r['length']:>8.2f} "         
+      187 +              f"{s2r['min_clearance']:>8.3f} {d2r:>11.2f}")   
+      188 +                                                              
+      189 +    # ── Visualisation 2x2 ───────────────────────────────────
+          +───────────                                                   
+      190      fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+      191      xx, yy = sdf_grid.meshgrid_world()
+      192  
+      136 -    # (0,0) Route 1 baseline                                  
+      193 +    dist_field = compute_path_distance_field(path1, sdf_grid) 
+      194 +    influence_zone = dist_field < attract.influence_radius    
+      195 +                                                              
+      196 +    # (0,0) Route 1 reference                                 
+      197      ax = axes[0, 0]
+      138 -    draw_base(ax, sdf_grid, obstacles, bounds, "Route 1 (Refer
+          -ence)")                                                       
+      139 -    ax.plot(path1[:, 0], path1[:, 1], color=route1["color"], l
+          -inewidth=3,                                                   
+      198 +    draw_base(ax, sdf_grid, obstacles, bounds,                
+      199 +              f"Route 1: {route1['name']}  (reference)")      
+      200 +    ax.plot(path1[:, 0], path1[:, 1], color=route1["color"], l
+          +w=3,                                                          
+      201              label=route1["name"], zorder=10)
+      202      ax.plot(*route1["start"], 'o', color=route1["color"], ms=1
+           0,
+      203              markeredgecolor='black', zorder=20)
+     ...
+      207  
+      208      # (0,1) Route 2 — no constraint
+      209      ax = axes[0, 1]
+      149 -    draw_base(ax, sdf_grid, obstacles, bounds, "Route 2 — No C
+          -onstraint")                                                   
+      150 -    ax.plot(path1[:, 0], path1[:, 1], color=route1["color"], l
+          -inewidth=1.5,                                                 
+      210 +    draw_base(ax, sdf_grid, obstacles, bounds,                
+      211 +              f"Route 2: {route2['name']}  (no constraint)")  
+      212 +    ax.plot(path1[:, 0], path1[:, 1], color=route1["color"], l
+          +w=1.5,                                                        
+      213              alpha=0.4, label="Route 1 (ref)", zorder=8)
+      214      if path2_none is not None:
+      215          ax.plot(path2_none[:, 0], path2_none[:, 1], color=rout
+           e2["color"],
+      154 -                linewidth=3, label=route2["name"], zorder=10) 
+      216 +                lw=3, label=route2["name"], zorder=10)        
+      217      ax.plot(*route2["start"], 'o', color=route2["color"], ms=1
+           0,
+      218              markeredgecolor='black', zorder=20)
+      219      ax.plot(*route2["goal"], 's', color=route2["color"], ms=10
+           ,
+     ...
+      222  
+      223      # (1,0) Route 2 — attract
+      224      ax = axes[1, 0]
+      163 -    draw_base(ax, sdf_grid, obstacles, bounds, "Route 2 — Attr
+          -act to Route 1")                                              
+      164 -    # # Show influence zone                                   
+      165 -    # dist_field = np.minimum(                                
+      166 -    #     *[np.abs(sdf_grid.values)] if False else            
+      167 -    #     [np.ones(sdf_grid.shape) * np.inf]                  
+      168 -    # )                                                       
+      169 -    from src.harness.path_constraints import compute_path_dist
+          -ance_field                                                    
+      170 -    dist_field = compute_path_distance_field(path1, sdf_grid) 
+      171 -    influence_mask = dist_field < attract.influence_radius    
+      172 -    ax.contourf(xx, yy, influence_mask.astype(float), levels=[
+          -0.5, 1.5],                                                    
+      225 +    draw_base(ax, sdf_grid, obstacles, bounds,                
+      226 +              "Route 2 — Attract to Route 1")                 
+      227 +    ax.contourf(xx, yy, influence_zone.astype(float), levels=[
+          +0.5, 1.5],                                                    
+      228                  colors=['lime'], alpha=0.15)
+      174 -    ax.plot(path1[:, 0], path1[:, 1], color=route1["color"], l
+          -inewidth=1.5,                                                 
+      229 +    ax.plot(path1[:, 0], path1[:, 1], color=route1["color"], l
+          +w=1.5,                                                        
+      230              alpha=0.4, label="Route 1 (ref)", zorder=8)
+      231      if path2_attract is not None:
+      232          ax.plot(path2_attract[:, 0], path2_attract[:, 1], colo
+           r='orange',
+      178 -                linewidth=3, label="Route 2 (attract)", zorder
+          -=10)                                                          
+      233 +                lw=3, label="Route 2 (attract)", zorder=10)   
+      234      if path2_none is not None:
+      235          ax.plot(path2_none[:, 0], path2_none[:, 1], color=rout
+           e2["color"],
+      181 -                linewidth=1.5, alpha=0.3, linestyle='--',     
+      182 -                label="Route 2 (no constraint)", zorder=9)    
+      236 +                lw=1.5, alpha=0.3, ls='--',                   
+      237 +                label="Route 2 (baseline)", zorder=9)         
+      238      ax.plot(*route2["start"], 'o', color='orange', ms=10,
+      239              markeredgecolor='black', zorder=20)
+      240      ax.plot(*route2["goal"], 's', color='orange', ms=10,
+     ...
+      243  
+      244      # (1,1) Route 2 — repel
+      245      ax = axes[1, 1]
+      191 -    draw_base(ax, sdf_grid, obstacles, bounds, "Route 2 — Repe
+          -l from Route 1")                                              
+      192 -    # Show influence zone                                     
+      193 -    ax.contourf(xx, yy, influence_mask.astype(float), levels=[
+          -0.5, 1.5],                                                    
+      246 +    draw_base(ax, sdf_grid, obstacles, bounds,                
+      247 +              "Route 2 — Repel from Route 1")                 
+      248 +    ax.contourf(xx, yy, influence_zone.astype(float), levels=[
+          +0.5, 1.5],                                                    
+      249                  colors=['red'], alpha=0.12)
+      195 -    ax.plot(path1[:, 0], path1[:, 1], color=route1["color"], l
+          -inewidth=1.5,                                                 
+      250 +    ax.plot(path1[:, 0], path1[:, 1], color=route1["color"], l
+          +w=1.5,                                                        
+      251              alpha=0.4, label="Route 1 (ref)", zorder=8)
+      252      if path2_repel is not None:
+      253          ax.plot(path2_repel[:, 0], path2_repel[:, 1], color='m
+           agenta',
+      199 -                linewidth=3, label="Route 2 (repel)", zorder=1
+          -0)                                                            
+      254 +                lw=3, label="Route 2 (repel)", zorder=10)     
+      255      if path2_none is not None:
+      256          ax.plot(path2_none[:, 0], path2_none[:, 1], color=rout
+           e2["color"],
+      202 -                linewidth=1.5, alpha=0.3, linestyle='--',     
+      203 -                label="Route 2 (no constraint)", zorder=9)    
+      257 +                lw=1.5, alpha=0.3, ls='--',                   
+      258 +                label="Route 2 (baseline)", zorder=9)         
+      259      ax.plot(*route2["start"], 'o', color='magenta', ms=10,
+      260              markeredgecolor='black', zorder=20)
+      261      ax.plot(*route2["goal"], 's', color='magenta', ms=10,
+      262              markeredgecolor='black', zorder=20)
+      263      ax.legend(fontsize=8)
+      264  
+      210 -    plt.suptitle("Multi-Route Constraints: Attraction & Repuls
+          -ion",                                                         
+      265 +    plt.suptitle("Multi-Route Constraints: Attraction & Repuls
+          +ion  (A* pipeline)",                                          
+      266                   fontsize=14, fontweight='bold')
+      267      plt.tight_layout()
+      268      plt.savefig("07_multi_route_constraints.png", dpi=150, bbo
+           x_inches='tight')
+
+● 现在运行测试。
+
+● Bash(cd "E:\_proj\SDF" && python -m pytest tests/ -v 2>&1)
+  ⎿  Interrupted · What should Claude do instead?
+
+> 我修改了07_multi_route_constraints.py代码，发现问题如下：采用A*，并且不进 
+  行梯度优化等后处理，得到第一条路径后，利用该路径吸引第二条路径，似乎没有  
+  效果，第二条路径不但没有尽量与第一条路径共用，反而离开更远。请分析原因，  
+  并提供修改方案。                                                          
+
+● 让我分析 A* 在 cost_modifier < 1 时为什么吸引失效。
+
+● Read 1 file (ctrl+o to expand)
+
+● 问题找到了。
+
+  根因分析
+
+  A* 的 启发函数不可容许（inadmissible） 导致吸引约束完全失效。
+
+  启发函数（第 86 行）：
+  h(n) = 欧氏距离 × spacing        ← 假设每格代价 = 1.0
+
+  但 cost_modifier 吸引模式下，走廊内的单格代价被降到了 0.05：
+  走廊内: cost_grid = base_cost × 0.05 = 0.05
+  走廊外: cost_grid = base_cost × 1.0  = 1.0
+
+  此时 h(n) 对走廊内路径的预估是实际代价的 20 倍，严重高估。
+
+  A* 的 f 值 = g(已走代价) + h(估计剩余)：
+  ┌──────────┬─────────────┬─────────────────┬───────────┐
+  │ 节点位置 │  g (累计)   │    h (估计)     │ f = g + h │
+  ├──────────┼─────────────┼─────────────────┼───────────┤
+  │ 走廊入口 │ 0.05 (很低) │ 8.0 (按1.0估的) │ 8.05      │
+  ├──────────┼─────────────┼─────────────────┼───────────┤
+  │ 直行一步 │ 1.0 (正常)  │ 7.0 (降了1.0)   │ 8.0       │
+  └──────────┴─────────────┴─────────────────┴───────────┘
+  走廊节点的 f 值反而更高！A*
+  永远优先展开直行节点，走廊被完全忽略。在某些几何条件下甚至找到比 baseline
+  更差的路径（因为不可容许启发函数不保证最优性）。
+
+  修复
+
+  启发函数必须乘以代价场的最小值，保证 h(n) ≤ 实际剩余代价：
+
+● Update(src\planning\astar.py)
+  ⎿  Added 8 lines, removed 1 line
+      82          g_score[start_row, start_col] = 0.0
+      83          came_from = {}
+      84  
+      85 +        # Admissible heuristic: scale by the minimum cell cost 
+         +so h(n)                                                        
+      86 +        # never overestimates the true remaining cost.  Without
+         + this,                                                         
+      87 +        # a cost_modifier < 1 (e.g. attraction corridor at 0.05
+         +) makes                                                        
+      88 +        # the heuristic inadmissible and A* ignores the cheap c
+         +orridor.                                                       
+      89 +        finite_costs = cost_grid[np.isfinite(cost_grid)]       
+      90 +        min_cost = float(finite_costs.min()) if len(finite_cost
+         +s) > 0 else 1.0                                                
+      91 +                                                               
+      92          def heuristic(row, col):
+      86 -            return np.sqrt((row - goal_row) ** 2 + (col - goal_
+         -col) ** 2) * sdf_grid.spacing                                  
+      93 +            return np.sqrt((row - goal_row) ** 2 + (col - goal_
+         +col) ** 2) * sdf_grid.spacing * min_cost                       
+      94  
+      95          # Priority queue: (f_score, counter, row, col)
+      96          counter = 0
+
+● 验证修改后的完整文件：
+
+● Read 1 file (ctrl+o to expand)
+
+● 修复完成。总结一下这个 bug：
+
+  问题
+
+  原启发函数 h(n) = 欧氏距离 × spacing 隐含假设：每格最低代价 = 1.0。
+
+  当 cost_modifier 的吸引模式把走廊代价降到 0.05 时，h(n)
+  对走廊路径的估计是真实代价的 20 倍，严重违反 A 的可容许性条件*（h(n) ≤ 
+  h*(n)）。
+
+  后果：
+  - 走廊节点的 f = g + h 被人为抬高，A* 始终优先展开走廊外的节点
+  - 走廊的低代价优势被高估的 h 完全淹没
+  - A* 退化为非最优搜索，找到的路径忽略甚至回避走廊
+
+  修复
+
+  min_cost = cost_grid 中有限值的最小值   # attract 时约 0.05
+  h(n) = 欧氏距离 × spacing × min_cost   # 保证 ≤ 真实剩余代价
+
+  修复后 f 值对比：
+  ┌──────────┬──────┬───────────────────┬──────┐
+  │ 节点位置 │  g   │    h (修复后)     │  f   │
+  ├──────────┼──────┼───────────────────┼──────┤
+  │ 走廊入口 │ 0.05 │ 8.0 × 0.05 = 0.4  │ 0.45 │
+  ├──────────┼──────┼───────────────────┼──────┤
+  │ 直行一步 │ 1.0  │ 7.0 × 0.05 = 0.35 │ 1.35 │
+  └──────────┴──────┴───────────────────┴──────┘
+  走廊节点的 f 值大幅低于直行节点 → A* 正确探索走廊 → 吸引生效。
+
+  副作用：min_cost 越小启发函数越弱，A*
+  探索的节点更多（速度稍慢）。但这是正确性和完备性的必要代价。无 cost_modifier 
+  时 min_cost = 1.0，行为不变，完全向后兼容。
+
+✻ Churned for 3m 4s

@@ -40,14 +40,53 @@ class FastMarchingPlanner(BasePlanner):
 
         speed = clamp(sdf / safety_margin, 0, 1) ^ exponent
         Zero speed inside obstacles, max speed far from obstacles.
+        When safety_margin <= 0, all free-space cells get speed 1.0 (binary mode).
         """
-        normalized = np.clip(sdf_grid.values / self.safety_margin, 0.0, 1.0)
+        if self.safety_margin > 0:
+            normalized = np.clip(sdf_grid.values / self.safety_margin, 0.0, 1.0)
+        else:
+            # Binary mode: 1.0 in free space, 0.0 in obstacles, no gradual zone
+            normalized = np.where(sdf_grid.values > 0, 1.0, 0.0)
         speed = normalized ** self.speed_exponent
         # Ensure minimum positive speed to avoid division issues in FMM
         speed = np.maximum(speed, 1e-10)
         # Zero out obstacle interiors
         speed[sdf_grid.values <= 0] = 1e-10
         return speed
+
+    @staticmethod
+    def _extrapolate_travel_time(travel_time: np.ndarray,
+                                 obstacle_mask: np.ndarray) -> np.ndarray:
+        """Replace obstacle travel-time values by extrapolating from free space.
+
+        Without this, obstacle cells carrying inf (or huge finite) values
+        corrupt ``np.gradient`` central-difference results at adjacent
+        free-space cells, sending the gradient tracer in wrong directions.
+
+        The extrapolation iteratively averages from free-space neighbours so
+        that boundary cells see a smooth, bounded travel-time landscape.
+        """
+        from scipy.ndimage import uniform_filter
+
+        tt = travel_time.copy()
+        bad = obstacle_mask | ~np.isfinite(tt)
+
+        # 3 iterations: covers obstacle cells within 3 grid cells of free space
+        for _ in range(3):
+            filled = np.where(bad, 0.0, tt)
+            weight = (~bad).astype(float)
+            sum_f = uniform_filter(filled, size=3, mode='nearest')
+            sum_w = uniform_filter(weight, size=3, mode='nearest')
+            expandable = bad & (sum_w > 0)
+            tt[expandable] = sum_f[expandable] / np.maximum(sum_w[expandable], 1e-10)
+            bad = obstacle_mask & ~np.isfinite(tt)  # still-bad obstacle cells
+
+        # Deep-interior obstacle cells unreached by extrapolation
+        still_bad = ~np.isfinite(tt)
+        if np.any(still_bad):
+            max_tt = np.max(tt[np.isfinite(tt)]) if np.any(np.isfinite(tt)) else 1.0
+            tt[still_bad] = max_tt
+        return tt
 
     def _trace_gradient(self, travel_time: np.ndarray, start_idx: np.ndarray,
                         goal_idx: np.ndarray, sdf_grid: SDFGrid,
@@ -58,21 +97,29 @@ class FastMarchingPlanner(BasePlanner):
             travel_time: (ny, nx) travel-time field.
             start_idx: (col, row) grid index of start.
             goal_idx: (col, row) grid index of goal.
-            sdf_grid: SDF grid for bounds checking.
+            sdf_grid: SDF grid for bounds checking and obstacle projection.
             max_steps: Maximum gradient descent steps.
 
         Returns:
             (N, 2) array of (col, row) grid indices along the path.
         """
         ny, nx = travel_time.shape
-        # Compute gradient of travel time: [d/dy, d/dx]
-        gt_y, gt_x = np.gradient(travel_time)
+
+        # Build a gradient-safe travel-time field: obstacle cells are replaced
+        # by values extrapolated from free-space neighbours.
+        obstacle_mask = sdf_grid.values <= 0
+        tt_safe = self._extrapolate_travel_time(travel_time, obstacle_mask)
+        gt_y, gt_x = np.gradient(tt_safe)
+
+        # Pre-compute SDF gradient field for obstacle projection
+        sdf_gy, sdf_gx = np.gradient(sdf_grid.values)
 
         step_size = self.step_factor
         current = start_idx.astype(float).copy()  # (col, row)
         goal_f = goal_idx.astype(float)
 
         path = [current.copy()]
+        stuck_count = 0
 
         for _ in range(max_steps):
             col, row = current[0], current[1]
@@ -98,12 +145,44 @@ class FastMarchingPlanner(BasePlanner):
             dcol = -gx / grad_mag * step_size
             drow = -gy / grad_mag * step_size
 
-            current = current + np.array([dcol, drow])
+            candidate = current + np.array([dcol, drow])
 
             # Clamp to grid bounds
-            current[0] = np.clip(current[0], 0, nx - 1)
-            current[1] = np.clip(current[1], 0, ny - 1)
+            candidate[0] = np.clip(candidate[0], 0, nx - 1)
+            candidate[1] = np.clip(candidate[1], 0, ny - 1)
 
+            # Obstacle check: if candidate is inside obstacle, project back out
+            c_col, c_row = candidate[0], candidate[1]
+            sdf_val = map_coordinates(sdf_grid.values, [[c_row], [c_col]],
+                                      order=1, mode='nearest')[0]
+            if sdf_val <= 0:
+                sgx = map_coordinates(sdf_gx, [[c_row], [c_col]],
+                                      order=1, mode='nearest')[0]
+                sgy = map_coordinates(sdf_gy, [[c_row], [c_col]],
+                                      order=1, mode='nearest')[0]
+                sg_mag = np.sqrt(sgx ** 2 + sgy ** 2)
+                if sg_mag > 1e-12:
+                    push = (0.5 - sdf_val) / (sg_mag * sdf_grid.spacing)
+                    candidate[0] += sgx / sg_mag * push
+                    candidate[1] += sgy / sg_mag * push
+                    candidate[0] = np.clip(candidate[0], 0, nx - 1)
+                    candidate[1] = np.clip(candidate[1], 0, ny - 1)
+                    sdf_val2 = map_coordinates(
+                        sdf_grid.values,
+                        [[candidate[1]], [candidate[0]]],
+                        order=1, mode='nearest')[0]
+                    if sdf_val2 <= 0:
+                        candidate = current.copy()
+
+            # Stuck detection: if position barely changes, break
+            if np.linalg.norm(candidate - current) < 1e-6:
+                stuck_count += 1
+                if stuck_count > 10:
+                    break
+            else:
+                stuck_count = 0
+
+            current = candidate
             path.append(current.copy())
 
         return np.array(path)
@@ -137,6 +216,10 @@ class FastMarchingPlanner(BasePlanner):
             return PlanResult(np.empty((0, 2)), float('inf'),
                               time.perf_counter() - t0, False,
                               metadata={"error": "Start inside obstacle"})
+        if sdf_grid.values[goal_row, goal_col] <= 0:
+            return PlanResult(np.empty((0, 2)), float('inf'),
+                              time.perf_counter() - t0, False,
+                              metadata={"error": "Goal inside obstacle"})
 
         # Build speed field
         speed = self._sdf_to_speed(sdf_grid)
@@ -146,29 +229,27 @@ class FastMarchingPlanner(BasePlanner):
             speed = np.maximum(speed, 1e-10)
             speed[sdf_grid.values <= 0] = 1e-10
 
-        # Create phi: masked array with goal as the known zero-arrival point
-        phi = np.ones((ny, nx))
+        # Create phi: masked array with goal as the known zero-arrival point.
+        # Mask obstacle cells so the FMM wavefront cannot propagate through
+        # them.  This is critical: without masking, obstacle cells get huge
+        # but *finite* travel-time values (speed = 1e-10 ≠ 0) which corrupt
+        # central-difference gradients at adjacent free-space cells.
+        phi = np.ma.MaskedArray(np.ones((ny, nx)),
+                                mask=(sdf_grid.values <= 0))
         phi[goal_row, goal_col] = -1.0
 
         # Compute travel time
         travel_time = skfmm.travel_time(phi, speed, dx=sdf_grid.spacing)
 
-        # Handle masked/inf values
-        # Handle masked/inf values - 增强版
+        # Convert to plain ndarray: masked (obstacle) cells become inf
         if isinstance(travel_time, np.ma.MaskedArray):
-            # 它是掩膜数组，但掩膜可能为None
-            if travel_time.mask is not None:
-                tt_array = np.where(travel_time.mask, np.inf, travel_time.data)
+            mask = travel_time.mask
+            if mask is np.ma.nomask or mask is None:
+                tt_array = np.asarray(travel_time.data, dtype=float)
             else:
-                # 掩膜为None，表示所有点都有效，直接使用数据
-                tt_array = travel_time.data
+                tt_array = np.where(mask, np.inf, travel_time.data)
         else:
-            # 它是普通数组，直接转换
-            tt_array = np.asarray(travel_time)
-        # if hasattr(travel_time, 'data'):
-        #     tt_array = np.where(travel_time.mask, np.inf, travel_time.data)
-        # else:
-        #     tt_array = np.asarray(travel_time)
+            tt_array = np.asarray(travel_time, dtype=float)
 
         # Check if start is reachable
         if np.isinf(tt_array[start_row, start_col]):

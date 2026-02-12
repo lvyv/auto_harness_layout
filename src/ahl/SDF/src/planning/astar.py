@@ -82,8 +82,15 @@ class AStarPlanner(BasePlanner):
         g_score[start_row, start_col] = 0.0
         came_from = {}
 
+        # Admissible heuristic: scale by the minimum cell cost so h(n)
+        # never overestimates the true remaining cost.  Without this,
+        # a cost_modifier < 1 (e.g. attraction corridor at 0.05) makes
+        # the heuristic inadmissible and A* ignores the cheap corridor.
+        finite_costs = cost_grid[np.isfinite(cost_grid)]
+        min_cost = float(finite_costs.min()) if len(finite_costs) > 0 else 1.0
+
         def heuristic(row, col):
-            return np.sqrt((row - goal_row) ** 2 + (col - goal_col) ** 2) * sdf_grid.spacing
+            return np.sqrt((row - goal_row) ** 2 + (col - goal_col) ** 2) * sdf_grid.spacing * min_cost
 
         # Priority queue: (f_score, counter, row, col)
         counter = 0

@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 
 from src.sdf import build_sdf_2d
 from src.planning import AStarPlanner, FastMarchingPlanner
-from src.viz import plot_path_on_sdf, plot_comparison
+from src.viz import plot_comparison
 from src.scenarios.simple_2d import scattered_circles, narrow_passage
 
 
@@ -44,12 +44,12 @@ def main():
         fig, axes = plt.subplots(1, 3, figsize=(20, 6))
 
         # 1. Speed field
-        X, Y = sdf_grid.meshgrid_world()
+        xx, yy = sdf_grid.meshgrid_world()
         speed = result_fmm.metadata.get('speed_field')
         if speed is not None:
-            cf = axes[0].contourf(X, Y, speed, levels=50, cmap='viridis')
+            cf = axes[0].contourf(xx, yy, speed, levels=50, cmap='viridis')
             plt.colorbar(cf, ax=axes[0], label='Speed')
-            axes[0].contour(X, Y, sdf_grid.values, levels=[0],
+            axes[0].contour(xx, yy, sdf_grid.values, levels=[0],
                             colors='red', linewidths=2)
             axes[0].set_title('Speed Field (from SDF)')
             axes[0].set_aspect('equal')
@@ -58,9 +58,9 @@ def main():
         tt = result_fmm.metadata.get('travel_time_field')
         if tt is not None:
             tt_vis = np.where(np.isinf(tt), np.nan, tt)
-            cf = axes[1].contourf(X, Y, tt_vis, levels=50, cmap='plasma')
+            cf = axes[1].contourf(xx, yy, tt_vis, levels=50, cmap='plasma')
             plt.colorbar(cf, ax=axes[1], label='Travel Time')
-            axes[1].contour(X, Y, sdf_grid.values, levels=[0],
+            axes[1].contour(xx, yy, sdf_grid.values, levels=[0],
                             colors='white', linewidths=2)
             if result_fmm.success:
                 axes[1].plot(result_fmm.path[:, 0], result_fmm.path[:, 1],
@@ -80,11 +80,11 @@ def main():
             plot_comparison(sdf_grid, paths, start, goal, title="A* vs FMM")
             # Reuse the figure from plot_comparison for the third panel
             # Instead, draw directly on axes[2]
-            axes[2].contourf(X, Y, sdf_grid.values, levels=50,
+            axes[2].contourf(xx, yy, sdf_grid.values, levels=50,
                              cmap='RdBu', alpha=0.5)
-            axes[2].contour(X, Y, sdf_grid.values, levels=[0],
+            axes[2].contour(xx, yy, sdf_grid.values, levels=[0],
                             colors='black', linewidths=2)
-            axes[2].contourf(X, Y, sdf_grid.values, levels=[-1e10, 0],
+            axes[2].contourf(xx, yy, sdf_grid.values, levels=[-1e10, 0],
                              colors='gray', alpha=0.5)
             if result_astar.success:
                 axes[2].plot(result_astar.path[:, 0], result_astar.path[:, 1],

@@ -6,7 +6,6 @@ sys.path.insert(0, ".")
 import numpy as np
 import pytest
 
-from src.sdf.grid import SDFGrid
 from src.sdf.from_obstacles import build_sdf_2d
 from src.harness.path_constraints import (
     PathConstraint, compute_path_distance_field,

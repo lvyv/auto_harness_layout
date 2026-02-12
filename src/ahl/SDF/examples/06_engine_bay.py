@@ -12,12 +12,11 @@ sys.path.insert(0, ".")
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyArrowPatch
 
 from src.sdf import build_sdf_2d
 from src.planning import AStarPlanner, FastMarchingPlanner, GradientOptimizer
-from src.harness import (Cable, path_statistics, smooth_path_bspline,
-                         smooth_with_bend_constraint, compute_curvature)
+from src.harness import (path_statistics, smooth_path_bspline,
+                         smooth_with_bend_constraint)
 from src.scenarios.engine_bay import engine_bay, engine_bay_multi_route
 
 
@@ -110,12 +109,12 @@ def run_single_route():
     ax5 = fig.add_subplot(2, 3, 5)  # Optimized path
     ax6 = fig.add_subplot(2, 3, 6)  # Final comparison
 
-    X, Y = sdf_grid.meshgrid_world()
+    xx, yy = sdf_grid.meshgrid_world()
 
     def draw_base(ax, title, alpha=0.5):
-        ax.contourf(X, Y, sdf_grid.values, levels=50, cmap='RdBu', alpha=alpha)
-        ax.contour(X, Y, sdf_grid.values, levels=[0], colors='black', linewidths=1.5)
-        ax.contourf(X, Y, sdf_grid.values, levels=[-1e10, 0], colors='#404040', alpha=0.8)
+        ax.contourf(xx, yy, sdf_grid.values, levels=50, cmap='RdBu', alpha=alpha)
+        ax.contour(xx, yy, sdf_grid.values, levels=[0], colors='black', linewidths=1.5)
+        ax.contourf(xx, yy, sdf_grid.values, levels=[-1e10, 0], colors='#404040', alpha=0.8)
         draw_obstacle_labels(ax, obstacles)
         ax.plot(start[0], start[1], 'g^', markersize=10, zorder=20, markeredgecolor='black')
         ax.plot(goal[0], goal[1], 'r*', markersize=12, zorder=20, markeredgecolor='black')
@@ -128,8 +127,8 @@ def run_single_route():
     from matplotlib.colors import TwoSlopeNorm
     vmax = max(abs(sdf_grid.values.min()), abs(sdf_grid.values.max()))
     norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
-    cf = ax1.contourf(X, Y, sdf_grid.values, levels=50, cmap='RdBu', norm=norm)
-    ax1.contour(X, Y, sdf_grid.values, levels=[0], colors='black', linewidths=2)
+    cf = ax1.contourf(xx, yy, sdf_grid.values, levels=50, cmap='RdBu', norm=norm)
+    ax1.contour(xx, yy, sdf_grid.values, levels=[0], colors='black', linewidths=2)
     plt.colorbar(cf, ax=ax1, label='SDF', shrink=0.8)
     draw_obstacle_labels(ax1, obstacles)
     ax1.set_title('SDF Field', fontsize=10)
@@ -138,8 +137,8 @@ def run_single_route():
     # 2. Cost field
     cost = sdf_grid.cost_field(safety_margin, alpha=12.0)
     cost_vis = np.where(np.isinf(cost), np.nan, cost)
-    cf2 = ax2.contourf(X, Y, cost_vis, levels=50, cmap='YlOrRd')
-    ax2.contourf(X, Y, sdf_grid.values, levels=[-1e10, 0], colors='black', alpha=0.8)
+    cf2 = ax2.contourf(xx, yy, cost_vis, levels=50, cmap='YlOrRd')
+    ax2.contourf(xx, yy, sdf_grid.values, levels=[-1e10, 0], colors='black', alpha=0.8)
     plt.colorbar(cf2, ax=ax2, label='Cost', shrink=0.8)
     draw_obstacle_labels(ax2, obstacles)
     ax2.set_title(f'Cost Field (margin={safety_margin})', fontsize=10)
@@ -174,9 +173,9 @@ def run_single_route():
         "A*+GradOpt+Smooth": ('yellow', 3.0, 1.0),
     }
     for name, path in all_paths.items():
-        color, lw, alpha = path_styles.get(name, ('white', 1.5, 0.5))
+        color, lw, alpha_d = path_styles.get(name, ('white', 1.5, 0.5))
         ax6.plot(path[:, 0], path[:, 1], color=color, linewidth=lw,
-                 alpha=alpha, label=name, zorder=10)
+                 alpha=alpha_d, label=name, zorder=10)
     ax6.legend(fontsize=8, loc='upper right')
 
     plt.suptitle("Engine Bay Wire Harness Routing - Complete Pipeline",
@@ -198,10 +197,10 @@ def run_multi_route():
     print("="*60)
 
     fig, ax = plt.subplots(1, 1, figsize=(12, 9))
-    X, Y = sdf_grid.meshgrid_world()
-    ax.contourf(X, Y, sdf_grid.values, levels=50, cmap='RdBu', alpha=0.4)
-    ax.contour(X, Y, sdf_grid.values, levels=[0], colors='black', linewidths=1.5)
-    ax.contourf(X, Y, sdf_grid.values, levels=[-1e10, 0], colors='#404040', alpha=0.8)
+    xx, yy = sdf_grid.meshgrid_world()
+    ax.contourf(xx, yy, sdf_grid.values, levels=50, cmap='RdBu', alpha=0.4)
+    ax.contour(xx, yy, sdf_grid.values, levels=[0], colors='black', linewidths=1.5)
+    ax.contourf(xx, yy, sdf_grid.values, levels=[-1e10, 0], colors='#404040', alpha=0.8)
     draw_obstacle_labels(ax, obstacles)
 
     for route in routes:
@@ -209,9 +208,9 @@ def run_multi_route():
         start, goal = route["start"], route["goal"]
         color = route["color"]
 
-        # Plan with FMM + gradient optimization
-        fmm = FastMarchingPlanner(safety_margin=0.5, speed_exponent=2.0)
-        result = fmm.plan(sdf_grid, start, goal)
+        # Plan with A* + gradient optimization
+        planner = AStarPlanner(safety_margin=0.5, cost_weight=12.0)
+        result = planner.plan(sdf_grid, start, goal)
 
         if result.success:
             # Optimize
@@ -250,8 +249,8 @@ def run_multi_route():
 
 
 def main():
-    fig1 = run_single_route()
-    fig2 = run_multi_route()
+    run_single_route()
+    run_multi_route()
     plt.show()
 
 

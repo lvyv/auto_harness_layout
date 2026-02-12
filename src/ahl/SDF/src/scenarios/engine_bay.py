@@ -39,7 +39,7 @@ def engine_bay():
          "label": "Battery"},
 
         # Intake manifold - upper right
-        {"type": "rectangle", "center": [6.0, 4.5], "half_extents": [1.0, 0.4],
+        {"type": "rectangle", "center": [6.0, 4.5], "half_extents": [1.0, 0.2],
          "label": "Intake Manifold"},
 
         # Exhaust pipe - front center (circular cross-section)
