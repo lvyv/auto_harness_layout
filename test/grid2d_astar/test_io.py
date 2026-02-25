@@ -4,9 +4,9 @@ import pytest
 import numpy as np
 
 
-from ahl.grid2d.core.grid import Grid
-from ahl.grid2d.core.cell_type import CellType
-from ahl.grid2d.io.npz_handler import save_grid, load_grid
+from ahl.AStar.core.grid import Grid
+from ahl.AStar.core.cell_type import CellType
+from ahl.AStar.io.npz_handler import save_grid, load_grid
 
 
 class TestIO:

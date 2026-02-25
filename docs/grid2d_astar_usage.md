@@ -1,4 +1,4 @@
-# Grid2D 编辑器使用指南
+# Grid2D AStar编辑器使用指南
 
 ## 简介
 
@@ -15,10 +15,10 @@ Grid2D 是一个完整的二维网格编辑器和 A* 路径规划系统，支持
 
 ```bash
 # 方式 1: 使用 uv 运行模块
-uv run python -m ahl.grid2d
+uv run python -m ahl.AStar
 
 # 方式 2: 使用启动脚本
-uv run python run_grid2d_editor.py
+uv run python run_grid2d_astar_editor.py
 ```
 
 ### 2. 界面操作
@@ -89,7 +89,7 @@ uv run python run_grid2d_editor.py
 ### 基本使用
 
 ```python
-from ahl.grid2d import Grid, CellType, astar_search, AStarConfig
+from ahl.AStar import Grid, CellType, astar_search, AStarConfig
 
 # 创建网格
 grid = Grid(width=50, height=50)
@@ -121,7 +121,7 @@ else:
 ### 保存和加载
 
 ```python
-from ahl.grid2d.io import save_grid, load_grid
+from ahl.AStar.io import save_grid, load_grid
 
 # 保存网格
 save_grid(grid, "my_grid.npz")
@@ -133,7 +133,7 @@ loaded_grid = load_grid("my_grid.npz")
 ### 批量路径规划
 
 ```python
-from ahl.grid2d.core.astar import batch_astar
+from ahl.AStar.core.astar import batch_astar
 
 # 计算多个起点到多个终点的所有路径
 starts = [(0, 0), (5, 5), (10, 10)]
@@ -237,14 +237,14 @@ NPZ 文件包含：
 运行完整测试套件：
 
 ```bash
-# 运行所有 grid2d 测试
-uv run pytest test/grid2d/ -v
+# 运行所有 AStar 测试
+uv run pytest test/AStar/ -v
 
 # 运行特定测试
-uv run pytest test/grid2d/test_astar.py -v
-uv run pytest test/grid2d/test_grid.py -v
-uv run pytest test/grid2d/test_sdf.py -v
-uv run pytest test/grid2d/test_io.py -v
+uv run pytest test/AStar/test_astar.py -v
+uv run pytest test/AStar/test_grid.py -v
+uv run pytest test/AStar/test_sdf.py -v
+uv run pytest test/AStar/test_io.py -v
 ```
 
 测试覆盖：

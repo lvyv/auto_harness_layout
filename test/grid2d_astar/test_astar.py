@@ -2,10 +2,10 @@
 
 import pytest
 
-from ahl.grid2d.core.grid import Grid
-from ahl.grid2d.core.cell_type import CellType
-from ahl.grid2d.core.astar import astar_search, batch_astar
-from ahl.grid2d.utils.validators import AStarConfig
+from ahl.AStar.core.grid import Grid
+from ahl.AStar.core.cell_type import CellType
+from ahl.AStar.core.astar import astar_search, batch_astar
+from ahl.AStar.utils.validators import AStarConfig
 
 
 class TestAStar:

@@ -1,4 +1,4 @@
-# Grid2D 实现总结
+# Grid2D AStar实现总结
 
 ## 实现概览
 
@@ -326,16 +326,16 @@ run_grid2d_editor.py         - 启动脚本
 
 ```bash
 # 方式 1
-uv run python -m ahl.grid2d
+uv run python -m ahl.AStar
 
 # 方式 2
-uv run python run_grid2d_editor.py
+uv run python run_astar_editor.py
 ```
 
 ### 编程接口
 
 ```python
-from ahl.grid2d import Grid, CellType, astar_search, AStarConfig
+from ahl.AStar import Grid, CellType, astar_search, AStarConfig
 
 # 创建网格
 grid = Grid(50, 50)
@@ -348,7 +348,8 @@ config = AStarConfig(diagonal_move=True, sdf_weight=0.5)
 path = astar_search(grid, (0, 0), (49, 49), config)
 
 # 保存
-from ahl.grid2d.io import save_grid
+from ahl.AStar.io import save_grid
+
 save_grid(grid, "my_grid.npz")
 ```
 

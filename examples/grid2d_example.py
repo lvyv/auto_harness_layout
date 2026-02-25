@@ -4,8 +4,8 @@ Grid2D 使用示例
 演示如何使用 Grid2D 模块进行路径规划
 """
 
-from ahl.grid2d import Grid, CellType, astar_search, AStarConfig
-from ahl.grid2d.io import save_grid, load_grid
+from ahl.AStar import Grid, CellType, astar_search, AStarConfig
+from ahl.AStar.io import save_grid, load_grid
 
 
 def example_1_simple_path():
@@ -89,7 +89,7 @@ def example_4_multiple_paths():
     print("示例 4: 多起点多终点")
     print("=" * 60)
 
-    from ahl.grid2d.core.astar import batch_astar
+    from ahl.AStar.core.astar import batch_astar
 
     grid = Grid(50, 50)
 
@@ -212,7 +212,7 @@ def main():
     print("所有示例运行完成!")
     print("=" * 60)
     print()
-    print("提示: 运行 'uv run python -m ahl.grid2d' 启动图形界面")
+    print("提示: 运行 'uv run python -m ahl.AStar' 启动图形界面")
     print()
 
 

@@ -2,8 +2,8 @@
 
 import numpy as np
 
-from ahl.grid2d.core.sdf import compute_sdf
-from ahl.grid2d.core.cell_type import CellType
+from ahl.AStar.core.sdf import compute_sdf
+from ahl.AStar.core.cell_type import CellType
 
 
 class TestSDF:

@@ -3,8 +3,8 @@
 import pytest
 import numpy as np
 
-from ahl.grid2d.core.grid import Grid
-from ahl.grid2d.core.cell_type import CellType
+from ahl.AStar.core.grid import Grid
+from ahl.AStar.core.cell_type import CellType
 
 
 class TestGrid:
