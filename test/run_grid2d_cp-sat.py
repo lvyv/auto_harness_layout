@@ -309,7 +309,7 @@ class ClickableRoutingVisualizer(QWidget):
     def __init__(self, router):
         super().__init__()
         self.router = router
-        self.cell_size = 20 # 每个格子的大小（像素）
+        self.cell_size = 16 # 每个格子的大小（像素）
         self.offset = 5  # 偏移量用于绘制多条线
 
         # 编辑模式标志
@@ -1082,8 +1082,8 @@ class MainWindow(QMainWindow):
 
 # --- 运行测试 ---
 if __name__ == "__main__":
-    width = 40
-    height = 40
+    width = 60
+    height = 60
 
     # 初始障碍物（边界）
     obstacles = set()
