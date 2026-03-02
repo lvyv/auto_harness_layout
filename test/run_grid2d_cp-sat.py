@@ -11,6 +11,24 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtCore import Qt, QRectF, pyqtSignal
 from PyQt6.QtGui import QPainter, QPen, QBrush, QColor, QMouseEvent, QAction
 
+from PyQt6.QtCore import QThread, pyqtSignal
+
+# 解决debug的崩溃问题
+class SolverThread(QThread):
+    finished_signal = pyqtSignal(bool)
+
+    def __init__(self, router, cables):
+        super().__init__()
+        self.router = router
+        self.cables = cables
+
+    def run(self):
+        try:
+            success = self.router.run(self.cables)
+        except Exception as e:
+            print("Solver crashed:", e)
+            success = False
+        self.finished_signal.emit(success)
 
 class CableConfigDialog(QDialog):
     """电缆配置对话框"""
@@ -620,6 +638,8 @@ class MainWindow(QMainWindow):
         self.current_file = None
         self.init_ui()
         self.create_menu()
+        # 初始计算路径
+        # self.recalculate_paths()
 
     def init_ui(self):
         self.setWindowTitle("Cable Harness Routing - Interactive Editor")
@@ -777,8 +797,6 @@ class MainWindow(QMainWindow):
         right_layout.addStretch()
         main_layout.addWidget(right_widget, 1)
 
-        # 初始计算路径
-        self.recalculate_paths()
 
     def create_menu(self):
         """创建菜单栏"""
@@ -944,21 +962,34 @@ class MainWindow(QMainWindow):
             self.visualizer.update()
             self.status_label.setText(f"Removed cable: {cable_id}")
 
+    # def recalculate_paths(self):
+    #     """重新计算路径"""
+    #     self.status_label.setText("Calculating paths...")
+    #     self.status_label.repaint()
+    #     QApplication.processEvents()
+    #
+    #     # 运行路径规划
+    #     success = self.router.run(self.cables)
+    #     if success:
+    #         self.status_label.setText("Paths calculated successfully!")
+    #     else:
+    #         self.status_label.setText("Warning: Some paths could not be found!")
+    #     # 刷新显示
+    #     self.visualizer.update()
+
     def recalculate_paths(self):
-        """重新计算路径"""
         self.status_label.setText("Calculating paths...")
-        self.status_label.repaint()
-        QApplication.processEvents()
 
-        # 运行路径规划
-        success = self.router.run(self.cables)
+        self.thread = SolverThread(self.router, self.cables)
+        self.thread.finished_signal.connect(self.on_solver_finished)
+        self.thread.start()
 
+    def on_solver_finished(self, success):
         if success:
             self.status_label.setText("Paths calculated successfully!")
         else:
             self.status_label.setText("Warning: Some paths could not be found!")
 
-        # 刷新显示
         self.visualizer.update()
 
     def clear_obstacles(self):
@@ -1082,8 +1113,8 @@ class MainWindow(QMainWindow):
 
 # --- 运行测试 ---
 if __name__ == "__main__":
-    width = 60
-    height = 60
+    width = 10
+    height = 10
 
     # 初始障碍物（边界）
     obstacles = set()
@@ -1099,23 +1130,23 @@ if __name__ == "__main__":
     obstacles.add((5, 6))
     obstacles.add((6, 5))
     obstacles.add((8, 8))
-    obstacles.add((8, 9))
-    obstacles.add((9, 8))
+    obstacles.add((6, 3))
+    obstacles.add((7, 4))
 
     # 创建路由器
     router = HarnessRouterGrid(
         width,
         height,
         obstacles,
-        wl=0.1,
+        wl=0.5,
         wb=1.2
     )
 
     # 定义电缆起点终点
     cables = [
         ('Cable_Red', (2, 2), (7, 7)),
-        ('Cable_Blue', (3, 3), (10, 10)),
-        ('Cable_Green', (4, 4), (9, 11))
+        ('Cable_Blue', (3, 3), (6, 6)),
+        ('Cable_Green', (4, 4), (3, 8))
     ]
 
     # 创建PyQt6应用
