@@ -23,6 +23,8 @@ class EditorToolbar(QToolBar):
     load_grid = pyqtSignal()
     edit_mode_changed = pyqtSignal(object)  # CellType
     reset_view = pyqtSignal()
+    thinning_grid = pyqtSignal()
+
 
     def __init__(self, parent=None):
         """Initialize toolbar.
@@ -71,6 +73,14 @@ class EditorToolbar(QToolBar):
         self.mode_combo.addItem("Eraser", CellType.FREE)
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         self.addWidget(self.mode_combo)
+        
+        self.addSeparator()
+        # Thinning
+        thinning_action = QAction("Thinning", self)
+        thinning_action.setToolTip("Apply thinning algorithm")
+        thinning_action.triggered.connect(self.thinning_grid.emit)
+        self.addAction(thinning_action)
+        
 
     def _on_mode_changed(self, index: int) -> None:
         """Handle edit mode change.

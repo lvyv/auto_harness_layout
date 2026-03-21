@@ -14,6 +14,7 @@ class GridConfig(BaseModel):
 
     width: int = Field(gt=0, le=1000, description="Grid width in cells")
     height: int = Field(gt=0, le=1000, description="Grid height in cells")
+    percent: int = Field(gt=0, le=100, description="Grid obstacle percentage")
     default_cell: int = Field(default=0, ge=0, le=4, description="Default cell type")
 
     @field_validator('width', 'height')

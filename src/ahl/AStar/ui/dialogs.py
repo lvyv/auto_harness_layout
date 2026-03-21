@@ -43,6 +43,15 @@ class NewGridDialog(QDialog):
         height_layout.addWidget(self.height_spin)
         layout.addLayout(height_layout)
 
+        # Percent
+        percent_layout = QHBoxLayout()
+        percent_layout.addWidget(QLabel("Obstacle Percent:"))
+        self.percent_spin = QSpinBox()
+        self.percent_spin.setRange(0, 100)
+        self.percent_spin.setValue(50)
+        percent_layout.addWidget(self.percent_spin)
+        layout.addLayout(percent_layout)
+
         # Buttons
         button_layout = QHBoxLayout()
         ok_button = QPushButton("Create")
@@ -62,6 +71,7 @@ class NewGridDialog(QDialog):
         return GridConfig(
             width=self.width_spin.value(),
             height=self.height_spin.value(),
+            percent=self.percent_spin.value(),
             default_cell=0
         )
 

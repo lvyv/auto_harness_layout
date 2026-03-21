@@ -4,6 +4,7 @@ from typing import Optional
 from PyQt6.QtWidgets import QWidget
 from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal
 from PyQt6.QtGui import QPainter, QColor, QPen, QMouseEvent, QWheelEvent
+from ..core.thin import GridSkeletonizerThinning
 
 from ..core.grid import Grid
 from ..core.cell_type import CellType
@@ -279,3 +280,14 @@ class GridWidget(QWidget):
         self.offset_y = (view_rect.height() - grid_height) / 2
 
         self.update()
+
+    def apply_thinning(self) -> None:
+        """Apply thinning algorithm to the grid."""
+        if self.grid is None:
+            return
+
+        sk = GridSkeletonizerThinning(self.grid)
+        sk.compute_skeleton()
+        graph = sk.build_graph()
+        # sk.prune(min_length=5)
+        sk.visualize()

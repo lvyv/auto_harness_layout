@@ -24,7 +24,7 @@ class Grid:
         config: Grid configuration
     """
 
-    def __init__(self, width: int, height: int, default_cell: int = 0):
+    def __init__(self, width: int, height: int, percent: int = 50, default_cell: int = 0):
         """Initialize grid.
 
         Args:
@@ -33,7 +33,7 @@ class Grid:
             default_cell: Default cell type (0=FREE)
         """
         # Validate configuration
-        self.config = GridConfig(width=width, height=height, default_cell=default_cell)
+        self.config = GridConfig(width=width, height=height, percent=percent, default_cell=default_cell)
 
         # Initialize grid
         self.cells = np.full((height, width), default_cell, dtype=np.int8)
@@ -268,4 +268,41 @@ class Grid:
         self.starts.clear()
         self.ends.clear()
         self.clear_paths()
+        self._sdf_dirty = True
+    
+    def random_obstacles(self, percent: float = 0.5, seed: Optional[int] = None, avoid_points: bool = True) -> None:
+        """
+        Randomly generate obstacles based on percentage.
+
+        Args:
+            percent: Obstacle ratio in [0, 1], e.g. 0.2 means 20% obstacles
+            seed: Random seed for reproducibility
+            avoid_points: Whether to avoid overwriting start/end points
+        """
+        if not (0.0 <= percent <= 1.0):
+            raise ValueError(f"percent must be in [0,1], got {percent}")
+
+        if seed is not None:
+            np.random.seed(seed)
+
+        H, W = self.shape
+        total_cells = H * W
+        num_obstacles = int(total_cells * percent)
+
+        # 所有候选位置
+        all_indices = [(r, c) for r in range(H) for c in range(W)]
+
+        # 避免覆盖 start/end
+        if avoid_points:
+            forbidden = set(self.starts + self.ends)
+            all_indices = [pos for pos in all_indices if pos not in forbidden]
+
+        # 随机采样
+        chosen = np.random.choice(len(all_indices), size=min(num_obstacles, len(all_indices)), replace=False)
+
+        for idx in chosen:
+            r, c = all_indices[idx]
+            self.cells[r, c] = CellType.OBSTACLE
+
+        # 标记 SDF 需要更新
         self._sdf_dirty = True

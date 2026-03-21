@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QStatusBar
 from PyQt6.QtCore import Qt
 
 from ..core.grid import Grid
-from ..core.astar import astar_search, batch_astar
+from ..core.astar import astar_search
 from ..io.npz_handler import save_grid, load_grid
 from .grid_widget import GridWidget
 from .control_panel import ControlPanel
@@ -78,6 +78,7 @@ class GridEditorWindow(QMainWindow):
         self.toolbar.load_grid.connect(self._on_load_grid)
         self.toolbar.edit_mode_changed.connect(self.grid_widget.set_edit_mode)
         self.toolbar.reset_view.connect(self.grid_widget.reset_view)
+        self.toolbar.thinning_grid.connect(self.grid_widget.apply_thinning)
 
         # Grid widget signals
         self.grid_widget.grid_changed.connect(self._on_grid_changed)
@@ -91,7 +92,8 @@ class GridEditorWindow(QMainWindow):
         dialog = NewGridDialog(self)
         if dialog.exec() == dialog.DialogCode.Accepted:
             config = dialog.get_grid_config()
-            self.grid = Grid(config.width, config.height, config.default_cell)
+            self.grid = Grid(config.width, config.height, config.percent, config.default_cell)
+            self.grid.random_obstacles(config.percent / 100)
             self.grid_widget.set_grid(self.grid)
             self.control_panel.grid = self.grid
             self.control_panel.update_grid_info()
